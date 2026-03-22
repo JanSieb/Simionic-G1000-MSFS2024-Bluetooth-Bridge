@@ -76,13 +76,12 @@ std::map<std::string, std::string> lastSessionDevices; // Key: Role, Value: MAC
 
 // New structure for the global hardware settings from [Settings]
 struct GlobalSettings {
-    std::string device_map_file; 
-    std::string command_map_file;
-    int scan_timeout_sec;
-    std::string characteristicUUID;               // For button data
-    std::string lightBrightnessCharacteristicUUID; // For light control
-    uint8_t defaultBrightness = 0x00; // Default fully on (level 4) - update from config
-    
+    std::string device_map_file;        // Specifies the file of the last know devices (with their roles etc.)
+    std::string command_map_file;       // Specifies the file of the command mapping (button/dial HEX codes -> MSFS2024 sim commands)
+    int scan_timeout_sec;               // Timeout for Bluetooth scanning in seconds - not used
+    std::string characteristicUUID;                 // Bluetooth data characteristic UUID for button data
+    std::string lightBrightnessCharacteristicUUID;  // Bluetooth data characteristic UUID for backlight control
+    uint8_t defaultBrightness = 0x00;   // Default backlight intensity: Fully on (level 4) - update from config
     // For rotary encoder acceleration:
     int fastTurnSensitivity1 = 250; // Threshold for brisk turning (ms)
     int fastTurnSensitivity2 = 130; // Threshold for fast turning (ms)
@@ -105,20 +104,6 @@ static WASMIF* wasmPtr = nullptr;
 // Buffer for WASM commands for the Sim
 static std::array<char, MAX_CALC_CODE_SIZE> ccode{};
 
-// The logic structure (Mapping HEX -> Command) is preserved
-struct CommandMapping {
-    std::array<std::string, 256> pfd_codes{}; // Commands for PFD mode
-    std::array<std::string, 256> mfd_codes{}; // Commands for MFD mode
-    size_t assignedCount = 0;
-    size_t maxlen = 0;
-};
-
-// The command map filled via the MACs from g_settings
-static std::unordered_map<std::string, CommandMapping> g_deviceMaps;
-
-enum class ControlMode { PFD, MFD };
-static std::atomic<ControlMode> g_currentMode{ ControlMode::PFD };
-
 class WASMIFGuard {
 public:
     explicit WASMIFGuard(WASMIF* p) : p_(p) {}
@@ -138,22 +123,6 @@ void trigger_fast_reconnect();
 // for brightness control
 static void send_brightness_to_all(uint8_t level);
 
-
-// Helper function: Searches in the list for the device for a role
-// Returns a pointer to the device, or nullptr if not found
-HardwareDevice* getDeviceByInstrument(const std::string& instrument) {
-    for (auto& dev : g_knownDevices) {
-        if (dev.instrument == instrument) {
-            return &dev;
-        }
-    }
-    return nullptr;
-}
-
-// Helper function for the display
-static std::string get_mode_string() {
-    return (g_currentMode == ControlMode::PFD) ? "PFD" : "MFD";
-}
 
 // Helper function: Simulates keyboard inputs in the console for pre-assignment
 void inject_default_input(const std::string& text) {
@@ -182,7 +151,7 @@ void inject_default_input(const std::string& text) {
     }
 }
 
-
+// Helper function: Trims whitespace
 static std::string trim(std::string s) {
     auto isspace2 = [](unsigned char ch){ return std::isspace(ch) != 0; };
     size_t start = 0;
@@ -192,20 +161,13 @@ static std::string trim(std::string s) {
     return s.substr(start, end - start);
 }
 
+// Helper function: Converts a string to lowercase
 static std::string to_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
     return s;
 }
 
-static std::string byte_to_hex(const SimpleBLE::ByteArray& bytes) {
-    if (bytes.empty()) return "";
-    char buf[3];
-    // We take the first byte (which contains the key code)
-    sprintf(buf, "%02X", (unsigned char)bytes[0]); 
-    return std::string(buf);
-}
-
-
+// Loads the Master Config with general settings (e.g. file paths etc.)
 bool load_master_config(const std::string& filename) {
     try {
         std::ifstream file(filename);
@@ -219,8 +181,17 @@ bool load_master_config(const std::string& filename) {
 
         // Apply file paths from 'general' section
         if (j.contains("general")) {
-            g_settings.device_map_file = j["general"].value("device_map_file", g_settings.device_map_file);
-             g_settings.command_map_file = j["general"].value("command_map_file", g_settings.command_map_file);
+            std::string temp_device = j["general"].value("device_map_file", "");
+            if (!temp_device.empty()) {
+                g_settings.device_map_file = temp_device;
+                KNOWN_DEVICES_FILENAME = temp_device; // Update global default
+            }
+
+            std::string temp_command = j["general"].value("command_map_file", "");
+            if (!temp_command.empty()) {
+                g_settings.command_map_file = temp_command;
+                COMMANDS_FILENAME = temp_command; // Update global default
+            }
         }
 
         // Apply UUIDs from the 'SHB1000' section
@@ -258,67 +229,7 @@ static void canonicalize_mac(const std::string& raw, std::string& out) {
     out = trim(out);
 }
 
-
-static void print_hex_bytes(const SimpleBLE::ByteArray& data, const std::string& devTag) {
-    std::cout << "[" << devTag << "] (" << data.size() << " bytes): ";
-    for (unsigned char c : data) {
-        std::cout << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
-                  << static_cast<int>(c) << " ";
-    }
-    std::cout << std::dec << std::nouppercase << std::endl;
-}
-
-
-static bool iequals_ascii(const std::string& a, const char* b) {
-    size_t n = a.size();
-    size_t m = std::strlen(b);
-    if (n != m) return false;
-    for (size_t i = 0; i < n; ++i) {
-        unsigned char ca = static_cast<unsigned char>(a[i]);
-        unsigned char cb = static_cast<unsigned char>(b[i]);
-        if (std::tolower(ca) != std::tolower(cb)) return false;
-    }
-    return true;
-}
-
-static bool is_hex_char(unsigned char c) {
-    return std::isxdigit(c) != 0;
-}
-
-static bool parse_config_line(const std::string& line, uint8_t& outKey, std::string& outValue) {
-    // Expected: <HEX> = "<calculator code>" OR <HEX> = unassigned
-    auto posEq = line.find('=');
-    if (posEq == std::string::npos) return false;
-
-    std::string left = trim(line.substr(0, posEq));
-    std::string right = trim(line.substr(posEq + 1));
-    if (left.empty() || right.empty()) return false;
-
-    // Parse left as hex byte (allow "A8" or "0xA8")
-    try {
-        unsigned long v = std::stoul(left, nullptr, 16);
-        if (v > 0xFFul) return false;
-        outKey = static_cast<uint8_t>(v & 0xFFu);
-    } catch (...) {
-        return false;
-    }
-
-    // Handle unassigned (case-insensitive, unquoted)
-    if (iequals_ascii(right, "unassigned")) {
-        outValue.clear(); // leave empty mapping
-        return true;
-    }
-
-    // Otherwise expect a quoted value
-    size_t firstQuote = right.find('"');
-    if (firstQuote == std::string::npos) return false;
-    size_t lastQuote = right.rfind('"');
-    if (lastQuote == std::string::npos || lastQuote <= firstQuote) return false;
-
-    outValue = right.substr(firstQuote + 1, lastQuote - firstQuote - 1);
-    return true;
-}
-
+// Loads the known devices from the JSON file to facilitate connection and role assignment
 bool load_known_devices(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) return false;
@@ -353,6 +264,7 @@ bool load_known_devices(const std::string& filename) {
     return true;
 }
 
+// Loads the command mapping from the config file to translate button/dial codes to sim commands
 bool load_command_map(const std::string& filename) {
     std::ifstream file(filename);
     std::string line, currentSection;
@@ -418,6 +330,7 @@ bool load_command_map(const std::string& filename) {
     return true;
 }
 
+// Saves the current known devices (with their roles etc.) into the JSON file
 void save_known_devices() {
     // 1. Get and format current time (YYYY-MM-DDTHH:MM:SS)
     auto now = std::chrono::system_clock::now();
@@ -480,112 +393,8 @@ void update_last_session_snapshot() {
 
 }
 
-
-/*
-static void load_code_map_from_file(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) {
-        std::cerr << "[ERROR] Configuration not found: " << path << std::endl;
-        return;
-    }
-
-    std::string line;
-    std::string currentSection;
-
-    while (std::getline(in, line)) {
-        std::string raw = trim(line);
-        if (raw.empty() || raw[0] == '#' || raw[0] == ';' || (raw.size() >= 2 && raw.substr(0, 2) == "//")) continue;
-
-        if (raw.front() == '[' && raw.back() == ']') {
-            currentSection = trim(raw.substr(1, raw.size() - 2));
-            continue;
-        }
-
-        if (currentSection == "Settings") {
-            auto pos = raw.find('=');
-            if (pos != std::string::npos) {
-                std::string key = trim(raw.substr(0, pos));
-                std::string val = trim(raw.substr(pos + 1));
-                if (val.size() >= 2 && val.front() == '"' && val.back() == '"') val = val.substr(1, val.size() - 2);
-
-                if (key == "DeviceNameFilter") g_settings.deviceNameFilter = val;
-                else if (key == "CharacteristicUUID") g_settings.characteristicUUID = to_lower(val);
-                else if (key == "PFD_MAC") canonicalize_mac(val, g_settings.pfdMac);
-                else if (key == "MFD_MAC") canonicalize_mac(val, g_settings.mfdMac);
-                else if (key == "DefaultBrightness") {
-                    int level = std::stoi(val);
-                    if (level == 0)      g_settings.defaultBrightness = 0x40; // OFF
-                    else if (level == 1) g_settings.defaultBrightness = 0x30; // Dark
-                    else if (level == 2) g_settings.defaultBrightness = 0x20; // Medium
-                    else if (level == 3) g_settings.defaultBrightness = 0x10; // Bright
-                    else if (level == 4) g_settings.defaultBrightness = 0x00; // MAX
-                    else g_settings.defaultBrightness = 0x00; // Fallback to MAX
-                }
-                else if (key == "LightBrightnessCharacteristicUUID") {
-                    g_settings.lightBrightnessCharacteristicUUID = to_lower(val);
-                }
-            }
-        }
-        else if (currentSection == "PFD_Commands" || currentSection == "MFD_Commands") {
-            // --- NEW INTELLIGENT HARDWARE MAPPING ---
-            
-            // 1. We determine the "Master MAC" for this setup
-            // If PFD_MAC is there, it's the base. If not, we take the MFD_MAC.
-            std::string targetMac = !g_settings.pfdMac.empty() ? g_settings.pfdMac : g_settings.mfdMac;
-
-            // 2. Special case: If BOTH MACs are in the config (Two-Bezel-Setup),
-            // then of course we strictly separate the commands again.
-            if (!g_settings.pfdMac.empty() && !g_settings.mfdMac.empty()) {
-                targetMac = (currentSection == "PFD_Commands") ? g_settings.pfdMac : g_settings.mfdMac;
-            }
-
-            if (targetMac.empty()) continue; // No hardware defined at all? Then continue.
-
-            uint8_t hexKey = 0;
-            std::string cmdValue;
-            if (parse_config_line(raw, hexKey, cmdValue)) {
-                CommandMapping& config = g_deviceMaps[targetMac];
-                
-                // We fill the respective "sub-array" of the hardware
-                if (currentSection == "PFD_Commands") {
-                    config.pfd_codes[hexKey] = cmdValue;
-                } else {
-                    config.mfd_codes[hexKey] = cmdValue;
-                }
-                
-                config.assignedCount++;
-                if (cmdValue.size() > config.maxlen) config.maxlen = cmdValue.size();
-            }
-        }
-
-    }
-    std::cout << "[OK] Configuration loaded. Single-Bezel mode ready.\n";
-}
-*/
-
-
-// Resolve config path for the given filename:
-// - In Release: use current working directory only.
-// - In Debug: also check exactly two directories up from CWD.
-static std::string resolve_config_path(const std::string& filename) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-
-    const fs::path cwd = fs::current_path(ec);
-    if (ec) return {};
-
-    fs::path candidate = cwd / filename;
-    if (fs::exists(candidate, ec) && !ec) return candidate.string();
-
-#if defined(_DEBUG)
-    fs::path up2 = cwd.parent_path().parent_path();
-    candidate = up2 / filename;
-    if (fs::exists(candidate, ec) && !ec) return candidate.string();
-#endif
-
-    return {};
-}
-
+// Helper function: Sends commands to the Sim safely with a mutex lock
+// in case Bluetooth data arrives faster than SimConnect can process it
 static void send_calc_code_safely(const std::string& code) {
     if (!wasmPtr || code.empty() || !wasmPtr->isRunning()) return;
     
@@ -597,6 +406,7 @@ static void send_calc_code_safely(const std::string& code) {
     wasmPtr->executeCalclatorCode(ccode.data());
 }
 
+// Handler for incoming Bluetooth packets from the devices
 void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
     // 1. Normalize MAC
     std::string cleanMac;
@@ -669,15 +479,6 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
     }
 }
 
-// Helper: log "Device: [tag] Input: XX Output: <text><suffix>" with proper hex formatting
-static void log_device_input_output(const std::string& devTag, uint8_t byte, const std::string& output, const std::string& suffix) {
-    std::cout << "Device: [" << devTag << "] Input: "
-              << std::hex << std::uppercase << std::setw(2) << std::setfill('0')
-              << static_cast<int>(byte)
-              << std::dec << std::nouppercase << std::setfill(' ')
-              << " Output: " << output << " " << suffix << " " << std::endl;
-}
-
 // Shared connected-device record
 struct ConnectedDevice {
     SimpleBLE::Peripheral p;              // The Bluetooth device
@@ -695,19 +496,8 @@ struct BleRuntime {
 };
 static BleRuntime g_ble;
 
-// Local helpers for BLE session logic
-static std::optional<SimpleBLE::Adapter> get_first_adapter() {
-    try {
-        auto adapters = SimpleBLE::Adapter::get_adapters();
-        if (adapters.empty()) return std::nullopt;
-        return adapters.front();
-    } catch (const std::exception& e) {
-        std::cerr << "Adapter enumeration failed: " << e.what() << std::endl;
-        return std::nullopt;
-    }
-}
-
-
+// Helper function: Finds the Bluetooth service UUID a desired characteristic UUID runs on for a particular peripheral
+// Important in case we know the characteristic UUID (e.g. from the config) but not the service UUID (because it might have changed with a firmware update etc.)
 static bool find_characteristic(SimpleBLE::Peripheral& p,
                          const std::string& desired_lower,
                          SimpleBLE::BluetoothUUID& out_service,
@@ -736,6 +526,7 @@ static void clear_adapter_callbacks(SimpleBLE::Adapter& adapter) {
     adapter.set_callback_on_scan_stop({});
 }
 
+// Function to cleanly tear down the Bluetooth connection without crashing the application
 static void safe_unsubscribe_and_disconnect(SimpleBLE::Peripheral& p,
                                             const SimpleBLE::BluetoothUUID& service_uuid,
                                             const SimpleBLE::BluetoothUUID& characteristic_uuid) {
@@ -745,6 +536,7 @@ static void safe_unsubscribe_and_disconnect(SimpleBLE::Peripheral& p,
     std::this_thread::sleep_for(std::chrono::milliseconds(300)); // settle time
 }
 
+// As the name implies: Gracefully shutdown of Bluetooth connections and WASMIF session with the Sim
 static void graceful_shutdown() {
     bool expected = false;
     if (!g_ble.shuttingDown.compare_exchange_strong(expected, true)) {
@@ -792,6 +584,7 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD type) {
     }
 }
 
+// Helper function: Blinks the device Blink_count times 
 static void blink_device(SimpleBLE::Peripheral p, 
                          const SimpleBLE::BluetoothUUID s_uuid, 
                          const SimpleBLE::BluetoothUUID c_uuid, 
@@ -821,7 +614,7 @@ static void blink_device(SimpleBLE::Peripheral p,
     }
 }
 
-// Inline implementation: continuously scan until all target MACs are found, then connect/subscribe all.
+// Scan, identify and connect to all target devices
 int ble_run_session_scan_until_all_addresses(
     const std::unordered_set<std::string>& target_macs,
     const std::string& desired_char_lower,
@@ -845,8 +638,23 @@ int ble_run_session_scan_until_all_addresses(
     // 1. Container for found, relevant devices
     std::vector<SimpleBLE::Peripheral> found_candidates;
 
+    // Extract unique device types from known devices for dynamic matching
+    std::vector<std::string> valid_types;
+    for (const auto& dev : g_knownDevices) {
+        if (!dev.type.empty() && dev.type != "UNKNOWN" && dev.type != "unknown") {
+            if (std::find(valid_types.begin(), valid_types.end(), dev.type) == valid_types.end()) {
+                valid_types.push_back(dev.type);
+            }
+        }
+    }
+    // Fallback if config has no valid types listed
+    if (valid_types.empty()) {
+        valid_types.push_back("SHB");
+        valid_types.push_back("SH100");
+    }
+
     // 2. Scan callback: Only check MACs, don't query names
-    adapter.set_callback_on_scan_found([&](SimpleBLE::Peripheral p) {
+    adapter.set_callback_on_scan_found([&, valid_types](SimpleBLE::Peripheral p) {
         std::string raw_addr = p.address();
         std::string clean_addr;
         canonicalize_mac(raw_addr, clean_addr); // Compress MAC to "aabbccddeeff" for matching
@@ -870,7 +678,31 @@ int ble_run_session_scan_until_all_addresses(
             if (it == found_candidates.end()) {
                 found_candidates.push_back(p);
                 std::cout << "  >>> MATCH! Device found in list and added." << std::endl;
-            } 
+            }
+        } 
+        // Always admit devices showing matching identifiers, even if unknown to config yet
+        else {
+            bool matched_type = false;
+            for (const auto& vt : valid_types) {
+                if (p.identifier().find(vt) == 0) {
+                    matched_type = true;
+                    break;
+                }
+            }
+
+            if (matched_type) {
+                auto it = std::find_if(found_candidates.begin(), found_candidates.end(),
+                    [&clean_addr](SimpleBLE::Peripheral& existing) {
+                        std::string existing_clean;
+                        canonicalize_mac(existing.address(), existing_clean);
+                        return existing_clean == clean_addr;
+                    });
+
+                if (it == found_candidates.end()) {
+                    found_candidates.push_back(p);
+                    std::cout << "  >>> [*NEW*] Discovered UNKNOWN but matching device: " << p.identifier() << " [" << raw_addr << "]" << std::endl;
+                }
+            }
         }
     });
 
@@ -879,17 +711,23 @@ int ble_run_session_scan_until_all_addresses(
     int attempts = 0;
     int max_attempts = is_reconnect ? 10 : 2; // 10 attempts on reconnect, 2 on startup
 
+    // If we have no known devices, we want to force scanning to find unseen/new devices
+    size_t required_targets = target_macs.size();
+    if (required_targets == 0 && !is_reconnect) {
+        required_targets = 1; // Force at least one scan iteration to find any new device
+    }
+
     std::cout << "\n[INFO] Start scan for " << target_macs.size() << " known devices..." << std::endl;
     std::cout << "----------------------------------------------------" << std::endl;
 
-    while (found_candidates.size() < target_macs.size() && attempts < max_attempts) {
+    while (found_candidates.size() < required_targets && attempts < max_attempts) {
         attempts++;
         if (attempts > 1) std::cout << "[RETRY] Starting attempt " << attempts << "..." << std::endl;
         // Only the actual scan process is repeated
         adapter.scan_for(scan_duration_ms); 
         
         // Short pause between attempts so the hardware can "breathe"
-        if (found_candidates.size() < target_macs.size() && attempts < max_attempts) {
+        if (found_candidates.size() < required_targets && attempts < max_attempts) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
     }
@@ -1210,7 +1048,7 @@ int ble_run_session_scan_until_all_addresses(
     std::cout << "----------------------------------------------------\n" << std::endl;
 
     // --- PHASE 3: WAIT LOOP FOR RECONNECT OR QUIT ---
-    std::cout << "PRESS 'R' TO RECONNECT | 'Q' TO QUIT\n" << std::endl;
+    std::cout << "PRESS 'R' TO RECONNECT | 'S' TO SWAP ROLES | 'Q' TO QUIT\n" << std::endl;
 
     while (!g_ble.shuttingDown) {
         if (_kbhit()) {
@@ -1233,6 +1071,7 @@ int ble_run_session_scan_until_all_addresses(
     return 0;
 }
 
+// Function to trigger a fast reconnect to lost Bluetooth devices based on the session snapshot
 void trigger_fast_reconnect() {
     if (lastSessionDevices.empty()) return;
     std::cout << "[RECONNECT] Disconnecting old devices asynchronously" << std::endl;
@@ -1272,23 +1111,7 @@ void trigger_fast_reconnect() {
 
 }
 
-
-
-// Attempt to canonicalize a device tag (devTag) into a MAC key
-static std::string devtag_to_mac_key(const std::string& devTag) {
-    std::string mac;
-    // Compress MAC to "aabbccddeeff" format
-    canonicalize_mac(devTag, mac);
-    
-    // If the result is not empty, we return it
-    if (!mac.empty()) {
-        return mac;
-    }
-    
-    // If devTag could not be processed, return empty
-    return {};
-}
-
+// Helper function: Send backlight brightness level to all connected devices
 static void send_brightness_to_all(uint8_t level) {
     SimpleBLE::ByteArray data;
     data.push_back(level); 
@@ -1309,10 +1132,10 @@ static void send_brightness_to_all(uint8_t level) {
     }
 }
 
-
+// ----------------------------------------------------
+// -------------- MAIN FUNCTION -----------------------
 int main(int argc, char* argv[]) {
 
-    std::unordered_set<std::string> target_macs;    // List of MACs we look for (from old config)
     std::unordered_set<std::string> knownDevices_macs;    // List of MACs we loaded from the new JSON config
 
 
