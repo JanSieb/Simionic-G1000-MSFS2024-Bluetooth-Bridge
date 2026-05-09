@@ -54,6 +54,8 @@ std::string COMMANDS_FILENAME = "SHB1000_commands.map";               // Variabl
 
 bool g_discoveryFinished = false; // Is only set to true when the setup dialog is finished
 bool initialBrightnessSet = false;  // If the brightness of the backlight has been initially set
+bool g_print_commands_to_console = false; // If true, ble commands and mappings are printed to std::cout
+
 std::atomic<bool> g_trigger_auto_reconnect{false}; // Trigger flag for auto-reconnect
 
 struct HardwareDevice {
@@ -591,6 +593,14 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
                 // DEBUG: Output of the average time difference
 //                std::cout << "[DEBUG] " << inputKey << " Average time difference (" << history.size() << " points): " << avg_diff << " ms  -> " << repetitions << " repetitions" << std::endl;
 
+            }
+            if (g_print_commands_to_console) {
+                // Formatting rawByte as hex
+                std::cout << "[COMMAND] " << role << " mapped byte 0x" << std::hex << std::uppercase << (int)rawByte << std::nouppercase << std::dec << " to: " << command;
+                if (repetitions > 1) {
+                    std::cout << " (x" << repetitions << ")";
+                }
+                std::cout << "\n";
             }
             // Send the command now 1x for slow or 5x for fast turning
             for(int i = 0; i < repetitions; ++i) {
@@ -1174,11 +1184,20 @@ int ble_run_session_scan_until_all_addresses(
     std::cout << "----------------------------------------------------\n" << std::endl;
 
     // --- PHASE 3: WAIT LOOP FOR RECONNECT OR QUIT ---
-    std::cout << "PRESS 'M' TO RELOAD MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | '?' FOR AIRCRAFT | 'Q' TO QUIT\n" << std::endl;
+    std::cout << "PRESS 'M' TO RELOAD MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | 'C' TO TOGGLE CMD PRINT | '?' FOR AIRCRAFT | 'Q' TO QUIT\n" << std::endl;
 
     while (!g_ble.shuttingDown) {
         if (_kbhit()) {
             char ch = _getch();
+            if (ch == 'c' || ch == 'C') {
+                g_print_commands_to_console = !g_print_commands_to_console;
+                if (g_print_commands_to_console) {
+                    std::cout << "\n[CONSOLE] Command printing enabled." << std::endl;
+                } else {
+                    std::cout << "\n[CONSOLE] Command printing disabled." << std::endl;
+                }
+            }
+
             if (ch == 'r' || ch == 'R') {
                 std::cout << "\n[RECONNECT] Starting fast reconnect attempt..." << std::endl;
                 // We stay in the main loop and only call the fast logic

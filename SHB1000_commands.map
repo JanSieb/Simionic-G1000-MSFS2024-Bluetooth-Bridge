@@ -34,8 +34,8 @@
 55 = unassigned
 
 # PFD HDG Encdr
-45 = "1 (>B:AS1000_HEADING_PFD_Dec)"
-44 = "1 (>B:AS1000_HEADING_PFD_Inc)"
+45 = "(>K:HEADING_BUG_DEC)"
+44 = "(>K:HEADING_BUG_INC)"
 
 # TODO: Investigate a fast turn rate option to inc/dec by 5 degrees
 
@@ -296,8 +296,8 @@ BF = "(>B:AS1000_FMS_UPPER_PUSH_PFD_PUSH)"
 55 = unassigned
 
 # MFD HDG Encdr
-45 = "1 (>B:AS1000_HEADING_MFD_Dec)"
-44 = "1 (>B:AS1000_HEADING_MFD_Inc)"
+45 = "(>K:HEADING_BUG_DEC)"
+44 = "(>K:HEADING_BUG_INC)"
 # TODO: Investigate a fast turn rate option to inc/dec by 5 degrees
 
 # MFD HDG Push

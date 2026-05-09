@@ -83,6 +83,9 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
     You can also apply this trick if you only have one bezel.\
     Hitting the **[S]** key will allow you to steer the cockpit's MFD using the same bezel. Don't forget to swap back to bring it back into PFD mode...\
     Needless to say, this only swaps the button input, but NOT what you see on a screen you might have plugged into the bezel...
+1. **Print Commands to Console**
+    * By default, the bridge silently passes button inputs from the bezel directly to the simulator.
+    * If you want to see which buttons emit which hex-code byte and which MSFS command they map to, you can press **[C]** on the app console. This will toggle command printing on or off.
 1. **Quit and Autostart**
     * **Ending the Bridge**\
       When you are done flying for the day and like to quit the bridge app as well, simply hit **[Q]** on its consol. The app like then gracefully shut down.\
