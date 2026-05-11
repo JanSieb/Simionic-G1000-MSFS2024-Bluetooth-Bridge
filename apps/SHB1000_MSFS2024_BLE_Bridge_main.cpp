@@ -104,6 +104,13 @@ struct GlobalSettings {
 static GlobalSettings g_settings;
 static std::mutex g_consoleMutex;
 
+// Globals for interactive aircraft map prompt
+static std::mutex g_pending_aircraft_mutex;
+static std::string g_pending_new_aircraft;
+static std::string g_suggested_map_id;
+static std::atomic<bool> g_interactive_prompt_active{false};
+static std::string g_current_aircraft_title;
+
 // Structure for the commands: Section name -> (Hex-Code -> Command)
 using CommandMap = std::unordered_map<std::string, std::map<uint8_t, std::string>>;
 CommandMap g_commandMaps;
@@ -130,6 +137,62 @@ struct AircraftData {
     char title[256];
 };
 
+static std::vector<std::string> tokenize_string(const std::string& str) {
+    std::vector<std::string> tokens;
+    std::string current_token;
+    for (char c : str) {
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            current_token += std::tolower(static_cast<unsigned char>(c));
+        } else if (!current_token.empty()) {
+            tokens.push_back(current_token);
+            current_token.clear();
+        }
+    }
+    if (!current_token.empty()) {
+        tokens.push_back(current_token);
+    }
+    return tokens;
+}
+
+static int calculate_similarity_score(const std::string& str1, const std::string& str2) {
+    auto tokens1 = tokenize_string(str1);
+    auto tokens2 = tokenize_string(str2);
+    
+    std::unordered_set<std::string> set1(tokens1.begin(), tokens1.end());
+    int score = 0;
+    for (const auto& t : tokens2) {
+        if (set1.count(t)) {
+            score++;
+        }
+    }
+    return score;
+}
+
+static std::string suggest_map_for_title(const std::string& newTitle, std::string& outSimilarAircraft) {
+    std::string best_map_id = g_settings.default_map_id;
+    int highest_score = 0;
+    std::string best_last_used = "";
+
+    outSimilarAircraft = "";
+
+    for (const auto& [title, entry] : g_settings.aircraft_history) {
+        int score = calculate_similarity_score(newTitle, title);
+        if (score > highest_score || (score == highest_score && score > 0 && entry.last_used > best_last_used)) {
+            highest_score = score;
+            best_map_id = entry.map_id;
+            best_last_used = entry.last_used;
+            outSimilarAircraft = title;
+        }
+    }
+
+    // fallback to default if no useful match
+    if (highest_score == 0) {
+        outSimilarAircraft = "";
+        best_map_id = g_settings.default_map_id;
+    }
+    return best_map_id;
+}
+
 void CALLBACK MyNativeDispatchProc(SIMCONNECT_RECV* pData, DWORD cbData, void* pContext) {
     switch (pData->dwID) {
         case SIMCONNECT_RECV_ID_SIMOBJECT_DATA: {
@@ -137,41 +200,67 @@ void CALLBACK MyNativeDispatchProc(SIMCONNECT_RECV* pData, DWORD cbData, void* p
             if (pObjData->dwRequestID == REQUEST_AIRCRAFT_TITLE) {
                 AircraftData* pAircraftData = (AircraftData*)&pObjData->dwData;
                 std::string title = pAircraftData->title;
+                g_current_aircraft_title = title;
                 std::string map_id = g_settings.default_map_id;
 
+                bool is_new_aircraft = false;
                 auto it = g_settings.aircraft_history.find(title);
                 if (it != g_settings.aircraft_history.end()) {
                     map_id = it->second.map_id;
+                } else {
+                    is_new_aircraft = true;
                 }
 
-                // Update timestamp
-                auto now = std::chrono::system_clock::now();
-                std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-                std::tm bt{};
-                localtime_s(&bt, &now_c);
-                std::stringstream ss;
-                ss << std::put_time(&bt, "%Y-%m-%dT%H:%M:%S");
-                
-                g_settings.aircraft_history[title] = {map_id, ss.str()};
-                save_master_config(); // Save right away
+                if (is_new_aircraft) {
+                    // Start interactive suggestion process
+                    std::string similar_title;
+                    std::string suggested_map = suggest_map_for_title(title, similar_title);
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(g_pending_aircraft_mutex);
+                        g_pending_new_aircraft = title;
+                        g_suggested_map_id = suggested_map;
+                    }
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(g_consoleMutex);
+                        std::cout << "\n[SIMCONNECT] Newly discovered Aircraft: " << title;
+                        std::cout << "\n[SIMCONNECT] Waiting for user input via console...\n";
+                    }
+                    
+                    // Temporarily load suggested map or default so it's not entirely empty
+                    auto map_it = g_settings.map_definitions.find(suggested_map);
+                    if (map_it != g_settings.map_definitions.end()) {
+                        COMMANDS_FILENAME = map_it->second;
+                        load_command_map(COMMANDS_FILENAME);
+                    }
+                } else {
+                    // Normal known aircraft update path
+                    // Update timestamp
+                    auto now = std::chrono::system_clock::now();
+                    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+                    std::tm bt{};
+                    localtime_s(&bt, &now_c);
+                    std::stringstream ss;
+                    ss << std::put_time(&bt, "%Y-%m-%dT%H:%M:%S");
+                    
+                    g_settings.aircraft_history[title] = {map_id, ss.str()};
+                    save_master_config(); // Save right away
 
-                // Match with map filenames
-                auto map_it = g_settings.map_definitions.find(map_id);
-                if (map_it != g_settings.map_definitions.end()) {
-                    COMMANDS_FILENAME = map_it->second;
-                }
+                    // Match with map filenames
+                    auto map_it = g_settings.map_definitions.find(map_id);
+                    if (map_it != g_settings.map_definitions.end()) {
+                        COMMANDS_FILENAME = map_it->second;
+                    }
 
-                {
-                    std::lock_guard<std::mutex> lock(g_consoleMutex);
-                    std::cout << "\n[SIMCONNECT] Currently used Aircraft: " << title;
-                    std::cout << "\n[SIMCONNECT] Auto loaded Map ID: " << map_id << " (" << COMMANDS_FILENAME << ")\n";
-                }
-                
-                load_command_map(COMMANDS_FILENAME);
-                
-                {
-                    std::lock_guard<std::mutex> lock(g_consoleMutex);
-                    std::cout << "PRESS 'M' TO RELOAD MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | '?' FOR AIRCRAFT | 'Q' TO QUIT" << std::endl;
+                    {
+                        std::lock_guard<std::mutex> lock(g_consoleMutex);
+                        std::cout << "\n[SIMCONNECT] Currently used Aircraft: " << title;
+                        std::cout << "\n[SIMCONNECT] Auto loaded Map ID: " << map_id << " (" << COMMANDS_FILENAME << ")\n";
+                        std::cout << "PRESS 'M' TO RELOAD MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | '?' FOR AIRCRAFT | 'Q' TO QUIT" << std::endl;
+                    }
+                    
+                    load_command_map(COMMANDS_FILENAME);
                 }
             }
             break;
@@ -195,6 +284,7 @@ private:
 
 
 // Forward declarations for various functions
+static void interactive_map_selection(const std::string& aircraft_title);
 // for the packet handler
 void on_packet(const SimpleBLE::ByteArray& data, const std::string& address);
 // for the fast reconnect function
@@ -1184,11 +1274,142 @@ int ble_run_session_scan_until_all_addresses(
     std::cout << "----------------------------------------------------\n" << std::endl;
 
     // --- PHASE 3: WAIT LOOP FOR RECONNECT OR QUIT ---
-    std::cout << "PRESS 'M' TO RELOAD MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | 'C' TO TOGGLE CMD PRINT | '?' FOR AIRCRAFT | 'Q' TO QUIT\n" << std::endl;
+    std::cout << "PRESS 'H' FOR HELP | 'M' TO RELOAD MAP | 'A' TO ASSIGN MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | 'C' TO TOGGLE CMD PRINT | '?' FOR AIRCRAFT | 'Q' TO QUIT\n" << std::endl;
 
     while (!g_ble.shuttingDown) {
+        // Check for pending aircraft to prompt
+        std::string current_pending_aircraft;
+        std::string current_suggested_map;
+        {
+            std::lock_guard<std::mutex> lock(g_pending_aircraft_mutex);
+            if (!g_pending_new_aircraft.empty()) {
+                current_pending_aircraft = g_pending_new_aircraft;
+                current_suggested_map = g_suggested_map_id;
+            }
+        }
+
+        if (!current_pending_aircraft.empty()) {
+            std::string display_name = current_suggested_map;
+            auto name_it = g_settings.map_names.find(current_suggested_map);
+            if (name_it != g_settings.map_names.end() && !name_it->second.empty()) {
+                display_name = name_it->second;
+            }
+            
+            bool valid_input = false;
+            g_interactive_prompt_active = true;
+            while (!valid_input && !g_ble.shuttingDown) {
+                {
+                    std::lock_guard<std::mutex> cout_lock(g_consoleMutex);
+                    std::cout << "\n==========================================================\n";
+                    std::cout << "NEW AIRCRAFT DETECTED: \"" << current_pending_aircraft << "\"\n";
+                    std::cout << "There is no mapping assigned to this variant yet.\n";
+                    std::cout << "Suggestion: Apply the '" << display_name << "' command map.\n";
+                    std::cout << "Press [Y] (and Enter) to ACCEPT, or [N] for other options.\n";
+                    std::cout << "==========================================================\n> ";
+                }
+
+                // Pre-fill 'Y' using the Windows API buffer injection
+                inject_default_input("Y");
+
+                std::string input;
+                std::getline(std::cin, input);
+
+                char ch = input.empty() ? 'Y' : std::toupper(input[0]);
+
+                if (ch == 'Y') {
+                    valid_input = true;
+                    // ACCEPT
+                    {
+                        std::lock_guard<std::mutex> lock(g_consoleMutex);
+                        std::cout << "[SYSTEM] Assigned '" << current_suggested_map << "' to '" << current_pending_aircraft << "'.\n";
+                    }
+
+                    // Save 
+                    auto now = std::chrono::system_clock::now();
+                    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+                    std::tm bt{};
+                    localtime_s(&bt, &now_c);
+                    std::stringstream ss;
+                    ss << std::put_time(&bt, "%Y-%m-%dT%H:%M:%S");
+
+                    g_settings.aircraft_history[current_pending_aircraft] = {current_suggested_map, ss.str()};
+                    save_master_config(); 
+
+                } else if (ch == 'N') {
+                    valid_input = true;
+                    interactive_map_selection(current_pending_aircraft);
+                } else {
+                    std::lock_guard<std::mutex> lock(g_consoleMutex);
+                    std::cout << "[ERROR] Invalid input. Please enter 'Y' or 'N'.\n";
+                }
+            }
+            g_interactive_prompt_active = false;
+
+            // Clear prompt state
+            {
+                std::lock_guard<std::mutex> lock(g_pending_aircraft_mutex);
+                g_pending_new_aircraft.clear();
+                g_suggested_map_id.clear();
+            }
+
+            continue; // Re-evaluate loop
+        }
+
         if (_kbhit()) {
             char ch = _getch();
+
+            if (ch == 'a' || ch == 'A') {
+                if (g_current_aircraft_title.empty()) {
+                    std::cout << "\n[SYSTEM] No aircraft loaded yet. Cannot assign map.\n";
+                    continue;
+                }
+                
+                g_interactive_prompt_active = true;
+                std::cout << "\n[SYSTEM] Re-assign command map for '" << g_current_aircraft_title << "'? [Y/N] (timeouts in 5s)...";
+                
+                int wait_ms = 5000;
+                bool confirmed = false;
+                bool answered = false;
+                
+                while(wait_ms > 0 && !g_ble.shuttingDown) {
+                    if (_kbhit()) {
+                        char ans = std::toupper(_getch());
+                        if (ans == 'Y') { confirmed = true; answered = true; break; }
+                        if (ans == 'N' || ans == 27) { confirmed = false; answered = true; break; } // 27 = ESC
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    wait_ms -= 100;
+                }
+                
+                if (!answered) {
+                    std::cout << " Timeout.\n[SYSTEM] Current map assignment kept.\n";
+                } else if (!confirmed) {
+                    std::cout << " Cancelled.\n[SYSTEM] Current map assignment kept.\n";
+                } else {
+                    std::cout << " Y\n";
+                    interactive_map_selection(g_current_aircraft_title);
+                }
+                
+                g_interactive_prompt_active = false;
+                continue;
+            }
+
+            if (ch == 'h' || ch == 'H') {
+                std::lock_guard<std::mutex> lock(g_consoleMutex);
+                std::cout << "\n--- Console Shortcuts Quick Reference ---\n";
+                std::cout << "  [H]     : Show this Help menu.\n";
+                std::cout << "  [Y]/[N] : Respond to prompts (e.g. Map Assignment).\n";
+                std::cout << "  [1]-[4] : Adjust Backlight Brightness ([0] for OFF).\n";
+                std::cout << "  [A]     : Manually Assign a new Command Map for the current aircraft.\n";
+                std::cout << "  [M]     : Reload Command Map and recheck current aircraft.\n";
+                std::cout << "  [R]     : Force Reconnect to Simionic Bezels and MSFS.\n";
+                std::cout << "  [S]     : Swap the roles of your devices (PFD <-> MFD).\n";
+                std::cout << "  [C]     : Toggle Command output printing in the console.\n";
+                std::cout << "  [?]     : Determine currently connected aircraft name.\n";
+                std::cout << "  [Q]     : Quit the application gracefully.\n";
+                std::cout << "-----------------------------------------\n";
+            }
+
             if (ch == 'c' || ch == 'C') {
                 g_print_commands_to_console = !g_print_commands_to_console;
                 if (g_print_commands_to_console) {
@@ -1295,6 +1516,68 @@ static void send_brightness_to_all(uint8_t level) {
 
 // ----------------------------------------------------
 // -------------- MAIN FUNCTION -----------------------
+static void interactive_map_selection(const std::string& aircraft_title) {
+    std::vector<std::pair<std::string, std::string>> available_maps;
+    for (const auto& [id, file] : g_settings.map_definitions) {
+        std::string nice_name = id;
+        auto nm_it = g_settings.map_names.find(id);
+        if (nm_it != g_settings.map_names.end() && !nm_it->second.empty()) {
+            nice_name = nm_it->second;
+        }
+        available_maps.push_back({id, nice_name});
+    }
+
+    bool valid_map_selected = false;
+    while (!valid_map_selected && !g_ble.shuttingDown) {
+        {
+            std::lock_guard<std::mutex> lock(g_consoleMutex);
+            std::cout << "\n--- Available Command Maps ---\n";
+            for (size_t i = 0; i < available_maps.size(); ++i) {
+                std::cout << "[" << (i + 1) << "] " << available_maps[i].second << " (" << available_maps[i].first << ")\n";
+            }
+            std::cout << "Enter the number of the map to assign to '" << aircraft_title << "': ";
+        }
+
+        std::string num_input;
+        std::getline(std::cin, num_input);
+
+        try {
+            size_t choice = std::stoull(num_input);
+            if (choice > 0 && choice <= available_maps.size()) {
+                valid_map_selected = true;
+                std::string selected_map_id = available_maps[choice - 1].first;
+                
+                {
+                    std::lock_guard<std::mutex> lock(g_consoleMutex);
+                    std::cout << "[SYSTEM] Assigned '" << selected_map_id << "' to '" << aircraft_title << "'.\n";
+                }
+
+                auto now = std::chrono::system_clock::now();
+                std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+                std::tm bt{};
+                localtime_s(&bt, &now_c);
+                std::stringstream ss;
+                ss << std::put_time(&bt, "%Y-%m-%dT%H:%M:%S");
+
+                g_settings.aircraft_history[aircraft_title] = {selected_map_id, ss.str()};
+                save_master_config(); 
+
+                auto map_it = g_settings.map_definitions.find(selected_map_id);
+                if (map_it != g_settings.map_definitions.end()) {
+                    COMMANDS_FILENAME = map_it->second;
+                    load_command_map(COMMANDS_FILENAME);
+                }
+            } else {
+                std::lock_guard<std::mutex> lock(g_consoleMutex);
+                std::cout << "[ERROR] Invalid selection. Please choose a number between 1 and " << available_maps.size() << ".\n";
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(g_consoleMutex);
+            std::cout << "[ERROR] Invalid input. Please enter a valid number.\n";
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
 
     std::unordered_set<std::string> knownDevices_macs;    // List of MACs we loaded from the new JSON config
@@ -1508,7 +1791,7 @@ int main(int argc, char* argv[]) {
             GetWindowThreadProcessId(hForeground, &foregroundProcessId);
 
             // Focus check
-            if (foregroundProcessId == myPid || hForeground == hConsole || (hConsole && hForeground == GetParent(hConsole))) {
+            if ((foregroundProcessId == myPid || hForeground == hConsole || (hConsole && hForeground == GetParent(hConsole))) && !g_interactive_prompt_active) {
                 
                 // 1. ROLE SWITCH (Key 'S')
                 bool s_is_down = (GetAsyncKeyState('S') & 0x8000) != 0;

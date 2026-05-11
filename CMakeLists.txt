@@ -84,4 +84,10 @@ configure_file(
     COPYONLY
 )
 
-install(FILES "SHB1000_known_devices.config" "SHB1000.config" "SHB1000_commands.map" DESTINATION .)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/readme.md"
+    "${CMAKE_CURRENT_BINARY_DIR}/readme.md"
+    COPYONLY
+)
+
+install(FILES "SHB1000_known_devices.config" "SHB1000.config" "SHB1000_commands.map" "readme.md" DESTINATION .)

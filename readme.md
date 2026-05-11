@@ -70,13 +70,23 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
       Should you not yet be in a cockpit, you can always trigger this manually by hitting the **[?]** key on the app console window. The app will then tell you the currently active model variant aircraft.\
       **Note**: From MSFS and the bridg app point of view, a passenger version Cesna 172 Skyhawk is different from a skydive, or cargo.
     * **Command Maps**\
-      Depending of the plane version, different command maps are used to account for the Garmin model contained in the sim.\
-      Currently, there are two command maps enclosed in the release.
+      Depending on the plane version, different command maps are used to account for the Garmin model contained in the sim.\
+      Currently, there are two command maps enclosed in the release:
       1. Standard Garmin G1000 (e.g. in C172 Skyhawks)
       2. G1000NXi with separate GMC 710 (e.g. in C208 Grand Caravan)
+    * **Automatically Assigning Maps to Unknown Aircraft**\
+      When you load an aircraft variant the bridge app hasn't seen before, it will intelligently compare the new aircraft's name to the planes in your history. If it finds a similar name, it will suggest a map assignment and pause with an interactive prompt:
+      ```text
+      Suggestion: Apply the 'Cessna 208 Cargo' command map.
+      Press [Y] (and Enter) to ACCEPT, or [N] for other options.
+      ```
+      * If you press **[Y]**, the map is permanently assigned to this variant.
+      * If you press **[N]**, the app will display a numbered list of all available command maps so you can manually select the correct one.
+    * **Manually Assigning a Map**\
+      If you realize an aircraft is using the wrong map, or if you skipped the prompt, you can manually re-assign the map at any time. Just press **[A]** on the app console. This will temporarily pause background inputs and let you choose a different map for your current aircraft from the menu.
     * **Reload Command Map**\
       If for some reason you feel the Garmin on your desk does not properly steer the Garmin in the sim, you might want to reload the Garmin Command Map once more.\
-      Hit **[M]** on the app consol to trigger a reload of the configured map. This will, incidentally, also trigger a recheck which aircraft you are in. So if, for example, you flew the last mission in a Cesna 172 Skyhawk and are now in the cockpit of a C208 Grand Caravan, simply **[Alt]+[Tab]** over to the bridg app, hit the M key and **[Alt]+[Tab]** back into the cockpit.
+      Hit **[M]** on the app consol to trigger a reload of the configured map. This will, incidentally, also trigger a recheck which aircraft you are in. So if, for example, you flew the last mission in a Cesna 172 Skyhawk and are now in the cockpit of a C208 Grand Caravan, simply **[Alt]+[Tab]** over to the bridg app, hit the **[M]** key and **[Alt]+[Tab]** back into the cockpit.
 1. **Swap Roles**
     * If you have two SHB bezels, one to use as your PFD, the other as MFD and you just happened to place them on your desk in the other order (left/right) you can simply swap their roles by hitting the **[S]** key.\
     The PFD then becomes MFD and vice versa.\
@@ -86,6 +96,17 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
 1. **Print Commands to Console**
     * By default, the bridge silently passes button inputs from the bezel directly to the simulator.
     * If you want to see which buttons emit which hex-code byte and which MSFS command they map to, you can press **[C]** on the app console. This will toggle command printing on or off.
+1. **Console Shortcuts Quick Reference**
+    * **[H]**: Show **H**elp menu with this list.
+    * **[Y]** / **[N]**: Respond to prompts (e.g. Map Assignment).
+    * **[1] - [4]** / **[0]**: Adjust Backlight Brightness.
+    * **[A]**: Manually **A**ssign a new Command Map for the current aircraft.
+    * **[M]**: Reload Command **M**ap and recheck current aircraft.
+    * **[R]**: Force **R**econnect to Simionic Bezels and MSFS.
+    * **[S]**: **S**wap the roles of your devices (PFD <-> MFD).
+    * **[C]**: Toggle **C**ommand output printing in the console.
+    * **[?]**: Determine currently connected aircraft name.
+    * **[Q]**: **Q**uit the application gracefully.
 1. **Quit and Autostart**
     * **Ending the Bridge**\
       When you are done flying for the day and like to quit the bridge app as well, simply hit **[Q]** on its consol. The app like then gracefully shut down.\
