@@ -294,7 +294,6 @@ BF = "(>B:AS1000_FMS_UPPER_PUSH_PFD_PUSH)"
 # MFD HDG Encdr
 45 = "1 (>B:AS1000_HEADING_MFD_Dec)"
 44 = "1 (>B:AS1000_HEADING_MFD_Inc)"
-# TODO: Investigate a fast turn rate option to inc/dec by 5 degrees
 
 # MFD HDG Push
 56 = "(>B:AS1000_HEADING_SYNC_MFD_PUSH)"
@@ -503,16 +502,17 @@ B4 = unassigned
 B5 = "(>B:AS1000_ENT_PUSH_MFD_PUSH)"
 
 # MFD FMS OUT
-29 = "1 (>B:AS1000_FMS_LOWER_MFD_Dec)"
 28 = "1 (>B:AS1000_FMS_LOWER_MFD_Inc)"
+29 = "1 (>B:AS1000_FMS_LOWER_MFD_Dec)"
 
 # MFD FMS IN
 27 = "1 (>B:AS1000_FMS_UPPER_MFD_Dec)"
 26 = "1 (>B:AS1000_FMS_UPPER_MFD_Inc)"
 
 # MFD FMS Push
-BE = unassigned
-BF = "(>B:AS1000_FMS_UPPER_PUSH_MFD_PUSH)"
+0xBE = "(>B:AS1000_FMS_Upper_PUSH_MFD_Toggle)"
+0xBF = "(>B:AS1000_FMS_Upper_PUSH_MFD_Neutral)"
+# Yes,releasing the button has a different code altogether. Apparently a coding mistake by MSFS developers! IMPORTANT TO HAVE LIKE THIS!
 
 
 # ---------------

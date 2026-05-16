@@ -28,6 +28,7 @@
 #include <iomanip>
 #include <sstream>
 #include <future>
+#include <cmath>
 
 #include "simpleble/SimpleBLE.h"
 #include "simpleble/Config.h"
@@ -46,6 +47,15 @@ using json = nlohmann::json;
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
+// Application version
+static const std::string APP_VERSION = "1.0.4";
+
+// --- ORBIT LOGIC ---
+static std::atomic<bool> g_orbit_active{false};
+static std::atomic<bool> g_orbit_evaluation_pending{false};
+static auto g_last_orbit_time = std::chrono::steady_clock::now();
+// -------------------
 
 // Configuration of filenames (default)
 constexpr const char* CONFIG_FILENAME = "SHB1000.config";             // HARD CODE filename for general settings
@@ -85,7 +95,6 @@ struct AircraftHistoryEntry {
 
 struct GlobalSettings {
     std::string device_map_file;        // Specifies the file of the last know devices (with their roles etc.)
-    std::string command_map_file;       // Specifies the file of the command mapping (button/dial HEX codes -> MSFS2024 sim commands)
     std::string default_map_id = "std_g1000";
     std::map<std::string, std::string> map_definitions;
     std::map<std::string, std::string> map_names; // Maps map_id to user friendly name
@@ -100,6 +109,11 @@ struct GlobalSettings {
     int fastTurnIncrements1 = 2;    // Steps for brisk turning
     int fastTurnIncrements2 = 5;    // Steps for fast turning
     int newTurnPause = 500;         // Pause in ms, after which a turn is considered new
+    
+    // For orbit feature
+    double orbitRadius = 5.0;            // NM distance to trigger orbit
+    double orbitHeadingCorrectionFar = 60.0; // Degrees to add to bearing when dist > orbitRadius
+    double orbitHeadingCorrectionNear = 85.0; // Degrees to add to bearing when dist <= orbitRadius
 };
 static GlobalSettings g_settings;
 static std::mutex g_consoleMutex;
@@ -126,16 +140,30 @@ static std::array<char, MAX_CALC_CODE_SIZE> ccode{};
 nlohmann::json g_master_config_json; // Global holder so we can rewrite aircraft updates without wiping comments
 void save_master_config(); // Forward declaration
 bool load_command_map(const std::string& filename); // Forward declaration
+void update_last_session_snapshot(); // Forward declaration
+static void play_toggle_beep(bool is_swapped, int count = 1, bool is_long = false); // Forward declaration
 
 // --- NATIVE SIMCONNECT FOR A-VARS ---
 #include <SimConnect.h>
 HANDLE g_hSimConnectNative = NULL;
-enum DATA_DEFINE_ID { DEFINITION_AIRCRAFT_TITLE = 1 };
-enum DATA_REQUEST_ID { REQUEST_AIRCRAFT_TITLE = 1 };
+enum DATA_DEFINE_ID { DEFINITION_AIRCRAFT_TITLE = 1, DEFINITION_ORBIT_DATA = 2 };
+enum DATA_REQUEST_ID { REQUEST_AIRCRAFT_TITLE = 1, REQUEST_ORBIT_DATA = 2 };
 
 struct AircraftData {
     char title[256];
 };
+
+struct OrbitData {
+    int32_t autopilot_master;
+    int32_t autopilot_hdg_lock;
+    double gps_wp_distance;
+    double gps_wp_bearing;
+};
+
+// Global storage for the latest fetched orbit data
+static std::mutex g_orbitDataMutex;
+static OrbitData g_latestOrbitData = {0, 0, 0.0, 0.0};
+static std::atomic<bool> g_orbitDataReady{false};
 
 static std::vector<std::string> tokenize_string(const std::string& str) {
     std::vector<std::string> tokens;
@@ -262,6 +290,72 @@ void CALLBACK MyNativeDispatchProc(SIMCONNECT_RECV* pData, DWORD cbData, void* p
                     
                     load_command_map(COMMANDS_FILENAME);
                 }
+            } else if (pObjData->dwRequestID == REQUEST_ORBIT_DATA) {
+                OrbitData* pOrbitData = (OrbitData*)&pObjData->dwData;
+                {
+                    std::lock_guard<std::mutex> lock(g_orbitDataMutex);
+                    g_latestOrbitData = *pOrbitData;
+                    g_orbitDataReady = true;
+
+                    // Output debug logs as requested
+                    auto t = std::time(nullptr);
+                    auto tm = *std::localtime(&t);
+                    std::ostringstream oss;
+                    oss << std::put_time(&tm, "%H:%M:%S");
+                    std::string timestamp = oss.str();
+
+                    bool dist_above_orbit = (pOrbitData->gps_wp_distance > g_settings.orbitRadius);
+
+                    if (g_print_commands_to_console) {
+                        std::cout << "[" << timestamp << "] [ORBIT] AP_MASTER=" << pOrbitData->autopilot_master 
+                                  << " | AP_HDG=" << pOrbitData->autopilot_hdg_lock
+                                  << " | DIST=" << pOrbitData->gps_wp_distance 
+                                  << " | BRG=" << pOrbitData->gps_wp_bearing 
+                                  << " | >" << g_settings.orbitRadius << "NM=" << (dist_above_orbit ? "true" : "false") << std::endl;
+                    }
+
+                    if (g_orbit_evaluation_pending) {
+                        g_orbit_evaluation_pending = false;
+                        if (pOrbitData->autopilot_master == 0) {
+                            play_toggle_beep(false, 1, true);
+                            std::cout << "\n[SYSTEM] Cannot engage Orbit Function: Autopilot is OFF." << std::endl;
+                        } else if (pOrbitData->autopilot_hdg_lock == 0) {
+                            play_toggle_beep(false, 1, true);
+                            std::cout << "\n[SYSTEM] Cannot engage Orbit Function: Autopilot HDG mode is disabled." << std::endl;
+                        } else {
+                            g_orbit_active = true;
+                            play_toggle_beep(g_orbit_active);
+                            std::cout << "\n[SYSTEM] Orbit Function successfully engaged! (ON)" << std::endl;
+                        }
+                    } else if (g_orbit_active) {
+                        if (pOrbitData->autopilot_master == 0) {
+                            g_orbit_active = false;
+                            play_toggle_beep(g_orbit_active, 3);
+                            std::cout << "\n[SYSTEM] AFK Orbit Function disengaged: Autopilot was turned OFF." << std::endl;
+                        } else if (pOrbitData->autopilot_hdg_lock == 0) {
+                            g_orbit_active = false;
+                            play_toggle_beep(g_orbit_active, 3);
+                            std::cout << "\n[SYSTEM] AFK Orbit Function disengaged: Autopilot HDG mode was disabled." << std::endl;
+                        } else {
+                            double correction = dist_above_orbit ? g_settings.orbitHeadingCorrectionFar : g_settings.orbitHeadingCorrectionNear;
+                            double target_heading = pOrbitData->gps_wp_bearing + correction;
+                            target_heading = std::fmod((target_heading + 360.0), 360.0);
+                            if (target_heading < 0.0) target_heading += 360.0;
+                            
+                            int rounded_heading = static_cast<int>(std::round(target_heading));
+                            
+                            if (g_print_commands_to_console) {
+                                std::cout << "[" << timestamp << "] [ORBIT] -> New HDG: " << rounded_heading << " (Correction: +" << correction << "\370)" << std::endl;
+                            }
+
+                            if (wasmPtr && wasmPtr->isRunning()) {
+                                char code[128];
+                                snprintf(code, sizeof(code), "%d (>K:HEADING_BUG_SET)", rounded_heading);
+                                wasmPtr->executeCalclatorCode(code);
+                            }
+                        }
+                    }
+                }
             }
             break;
         }
@@ -286,6 +380,85 @@ private:
 // Forward declarations for various functions
 static void interactive_map_selection(const std::string& aircraft_title);
 // for the packet handler
+// Shared connected-device record
+struct ConnectedDevice {
+    SimpleBLE::Peripheral p;              // The Bluetooth device
+    SimpleBLE::BluetoothUUID service_uuid; // The service (general)
+    SimpleBLE::BluetoothUUID char_uuid;    // The characteristic (for light & buttons)
+    bool used_indicate;
+};
+
+// Runtime context for shutdown across normal path and console-close handler
+struct BleRuntime {
+    std::mutex m;
+    std::atomic_bool shuttingDown{false};
+    std::optional<SimpleBLE::Adapter> adapter;
+    std::unordered_map<std::string, ConnectedDevice> connected; // mac -> device
+};
+static BleRuntime g_ble;
+
+// Configuration for Combo 
+const std::chrono::milliseconds COMBO_WINDOW(250);
+std::atomic<uint8_t> pending_first_key(0x00); 
+std::chrono::steady_clock::time_point first_key_time;
+std::atomic<bool> combo_active_block(false);
+
+// Beep routine extracted to allow passing the toggle state
+static void play_toggle_beep(bool is_swapped, int count, bool is_long) {
+    int duration = is_long ? 900 : 150;
+    int frequency = is_swapped ? 800 : 1600;
+
+    for (int i = 0; i < count; ++i) {
+        Beep(frequency, duration);
+        if (i < count - 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
+
+// Role Switch Helper
+static void perform_role_switch(bool play_beep = true) {
+    static bool g_role_swapped_state = false;
+    g_role_swapped_state = !g_role_swapped_state;
+
+    {
+        // We briefly lock the BLE object so that on_packet does not read at the same time
+        std::lock_guard<std::mutex> lock(g_ble.m);
+        
+        // Step 1: Mark intention for ALL active devices
+        for (auto& dev : g_knownDevices) {
+            if (g_ble.connected.count(dev.address)) {
+                if (dev.instrument == "PFD") {
+                    dev.instrument = "TEMP_MFD";
+                } else if (dev.instrument == "MFD") {
+                    dev.instrument = "TEMP_PFD";
+                }
+            }
+        }
+
+        // Step 2: "Washing" - Finalize all temporary labels
+        for (auto& dev : g_knownDevices) {
+            if (dev.instrument == "TEMP_MFD") {
+                dev.instrument = "MFD";
+                std::cout << "[SWITCH] " << dev.ble_name << " [" << dev.address << "] is now MFD" << std::endl;
+            } else if (dev.instrument == "TEMP_PFD") {
+                dev.instrument = "PFD";
+                std::cout << "[SWITCH] " << dev.ble_name << " [" << dev.address << "] is now PFD" << std::endl;
+            }
+        }
+    }
+
+    // Acoustic feedback & log
+    {
+        std::lock_guard<std::mutex> lock(g_consoleMutex);
+        if (play_beep) {
+            play_toggle_beep(g_role_swapped_state);
+        }
+        std::cout << "[SYSTEM] Role switch performed.\n" << std::endl;
+        update_last_session_snapshot(); // Synchronize snapshot for reconnect
+    }
+}
+
 void on_packet(const SimpleBLE::ByteArray& data, const std::string& address);
 // for the fast reconnect function
 void trigger_fast_reconnect();
@@ -373,12 +546,6 @@ bool load_master_config(const std::string& filename) {
             }
 
             g_settings.default_map_id = j["general"].value("default_map_id", "std_g1000");
-
-            std::string temp_command = j["general"].value("command_map_file", "");
-            if (!temp_command.empty()) {
-                g_settings.command_map_file = temp_command;
-                COMMANDS_FILENAME = temp_command; // Update global default
-            }
         }
         
         // Apply maps dictionary
@@ -420,11 +587,14 @@ bool load_master_config(const std::string& filename) {
             g_settings.fastTurnIncrements1 = shb.value("fastTurnIncrements1", g_settings.fastTurnIncrements1);
             g_settings.fastTurnIncrements2 = shb.value("fastTurnIncrements2", g_settings.fastTurnIncrements2);
             g_settings.newTurnPause = shb.value("newTurnPause", g_settings.newTurnPause);
+            
+            g_settings.orbitRadius = shb.value("orbitRadius", g_settings.orbitRadius);
+            g_settings.orbitHeadingCorrectionFar = shb.value("orbitHeadingCorrectionFar", g_settings.orbitHeadingCorrectionFar);
+            g_settings.orbitHeadingCorrectionNear = shb.value("orbitHeadingCorrectionNear", g_settings.orbitHeadingCorrectionNear);
         }
 
         std::cout << "[OK] Master config loaded."<< std::endl;
         std::cout << "[INFO] Device config: " << g_settings.device_map_file << std::endl;
-        std::cout << "[INFO] Command config: " << g_settings.command_map_file << std::endl;
         return true;
 
     } catch (const nlohmann::json::parse_error& e) {
@@ -684,6 +854,70 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
 //                std::cout << "[DEBUG] " << inputKey << " Average time difference (" << history.size() << " points): " << avg_diff << " ms  -> " << repetitions << " repetitions" << std::endl;
 
             }
+
+            // COMBO LOGIC for 0x5E (FLC) and 0x5A (VS)
+            if (rawByte == 0x5E || rawByte == 0x5A) {
+                uint8_t pending = pending_first_key.load();
+                if (pending == 0) {
+                    // No key waiting
+                    pending_first_key.store(rawByte);
+                    first_key_time = std::chrono::steady_clock::now();
+                    
+                    // Launch timeout worker
+                    std::thread([rawByte, command, repetitions, role]() {
+                        std::this_thread::sleep_for(COMBO_WINDOW);
+                        if (pending_first_key.load() == rawByte) {
+                            // Timeout expired
+                            pending_first_key.store(0x00);
+                            
+                            // Send delayed command
+                            if (g_print_commands_to_console) {
+                                auto now_sys = std::chrono::system_clock::now();
+                                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_sys.time_since_epoch()) % 1000;
+                                auto now_time_t = std::chrono::system_clock::to_time_t(now_sys);
+                                std::tm now_tm;
+                                localtime_s(&now_tm, &now_time_t);
+
+                                std::cout << "[" << std::put_time(&now_tm, "%H:%M:%S") << "." << std::setfill('0') << std::setw(3) << now_ms.count() << "] "
+                                          << "[COMMAND] " << role << " mapped byte 0x" << std::hex << std::uppercase << (int)rawByte << std::nouppercase << std::dec << " to: " << command;
+                                if (repetitions > 1) {
+                                    std::cout << " (x" << repetitions << ")";
+                                }
+                                std::cout << "\n";
+                            }
+                            for(int i = 0; i < repetitions; ++i) {
+                                send_calc_code_safely(command);
+                            }
+                        }
+                    }).detach();
+                    return; // Halt execution
+                } else {
+                    // A key is already waiting
+                    if ((pending == 0x5E && rawByte == 0x5A) || (pending == 0x5A && rawByte == 0x5E)) {
+                        auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - first_key_time);
+                        if (delta <= COMBO_WINDOW) {
+                            // Combo Detected!
+                            pending_first_key.store(0x00);
+                            combo_active_block.store(true);
+                            
+                            // Safety cooldown to reset combo block after release bytes arrive
+                            std::thread([]() {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                                combo_active_block.store(false);
+                            }).detach();
+
+                            perform_role_switch(true);
+                            return; // Halt execution
+                        }
+                    }
+                }
+            }
+
+            // Ignoring Release Bytes if Combo activated
+            if ((rawByte == 0x5F || rawByte == 0x5B) && combo_active_block.load()) {
+                return;
+            }
+
             if (g_print_commands_to_console) {
                 // Formatting rawByte as hex
                 std::cout << "[COMMAND] " << role << " mapped byte 0x" << std::hex << std::uppercase << (int)rawByte << std::nouppercase << std::dec << " to: " << command;
@@ -699,23 +933,6 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
         }
     }
 }
-
-// Shared connected-device record
-struct ConnectedDevice {
-    SimpleBLE::Peripheral p;              // The Bluetooth device
-    SimpleBLE::BluetoothUUID service_uuid; // The service (general)
-    SimpleBLE::BluetoothUUID char_uuid;    // The characteristic (for light & buttons)
-    bool used_indicate;
-};
-
-// Runtime context for shutdown across normal path and console-close handler
-struct BleRuntime {
-    std::mutex m;
-    std::atomic_bool shuttingDown{false};
-    std::optional<SimpleBLE::Adapter> adapter;
-    std::unordered_map<std::string, ConnectedDevice> connected; // mac -> device
-};
-static BleRuntime g_ble;
 
 // Helper function: Finds the Bluetooth service UUID a desired characteristic UUID runs on for a particular peripheral
 // Important in case we know the characteristic UUID (e.g. from the config) but not the service UUID (because it might have changed with a firmware update etc.)
@@ -1394,9 +1611,27 @@ int ble_run_session_scan_until_all_addresses(
                 continue;
             }
 
+            if (ch == 'o' || ch == 'O') {
+                if (g_orbit_active) {
+                    g_orbit_active = false;
+                    play_toggle_beep(g_orbit_active);
+                    std::cout << "\n[SYSTEM] Orbit Function is now OFF." << std::endl;
+                } else {
+                    if (!g_hSimConnectNative) {
+                        play_toggle_beep(false, 1, true);
+                        std::cout << "\n[SYSTEM] Cannot engage Orbit Function: No active SIM connection." << std::endl;
+                    } else {
+                        std::cout << "\n[SYSTEM] Checking conditions to engage Orbit Function..." << std::endl;
+                        g_orbit_evaluation_pending = true;
+                        SimConnect_RequestDataOnSimObject(g_hSimConnectNative, REQUEST_ORBIT_DATA, DEFINITION_ORBIT_DATA, SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD_ONCE);
+                    }
+                }
+            }
+
             if (ch == 'h' || ch == 'H') {
                 std::lock_guard<std::mutex> lock(g_consoleMutex);
                 std::cout << "\n--- Console Shortcuts Quick Reference ---\n";
+                std::cout << "  [O]     : Toggle Orbit Function on/off.\n";
                 std::cout << "  [H]     : Show this Help menu.\n";
                 std::cout << "  [Y]/[N] : Respond to prompts (e.g. Map Assignment).\n";
                 std::cout << "  [1]-[4] : Adjust Backlight Brightness ([0] for OFF).\n";
@@ -1441,6 +1676,14 @@ int ble_run_session_scan_until_all_addresses(
             }
         }
         
+        if (g_orbit_active && g_hSimConnectNative) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - g_last_orbit_time).count() >= 5000) {
+                SimConnect_RequestDataOnSimObject(g_hSimConnectNative, REQUEST_ORBIT_DATA, DEFINITION_ORBIT_DATA, SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD_ONCE);
+                g_last_orbit_time = now;
+            }
+        }
+
         if (g_trigger_auto_reconnect) {
             g_trigger_auto_reconnect = false;
             std::cout << "\n[AUTO-RECONNECT] Initiating fast reconnect after connection loss..." << std::endl;
@@ -1590,7 +1833,7 @@ int main(int argc, char* argv[]) {
     // Set process priority to elevated
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 
-    std::cout << "[INFO]: Program start!" << std::endl; 
+    std::cout << "[INFO]: Program start! [Vers. " << APP_VERSION << "]" << std::endl; 
 
     // Ensure teardown runs on console close / Ctrl+C
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
@@ -1662,6 +1905,10 @@ int main(int argc, char* argv[]) {
             if (g_hSimConnectNative == NULL) {
                 if (SUCCEEDED(SimConnect_Open(&g_hSimConnectNative, "BLE Bridge Native", NULL, 0, 0, 0))) {
                     SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_AIRCRAFT_TITLE, "TITLE", NULL, SIMCONNECT_DATATYPE_STRING256);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "AUTOPILOT MASTER", "Bool", SIMCONNECT_DATATYPE_INT32);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "AUTOPILOT HEADING LOCK", "Bool", SIMCONNECT_DATATYPE_INT32);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "GPS WP DISTANCE", "Nautical miles", SIMCONNECT_DATATYPE_FLOAT64);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "GPS WP BEARING", "Degrees", SIMCONNECT_DATATYPE_FLOAT64);
                     std::cout << "[INFO] Native SimConnect connection established for A-Vars." << std::endl;
                     initial_aircraft_check_done = false;
                 }
@@ -1796,40 +2043,7 @@ int main(int argc, char* argv[]) {
                 // 1. ROLE SWITCH (Key 'S')
                 bool s_is_down = (GetAsyncKeyState('S') & 0x8000) != 0;
                 if (s_is_down && !s_was_pressed) {
-                    {
-                        // We briefly lock the BLE object so that on_packet does not read at the same time
-                        std::lock_guard<std::mutex> lock(g_ble.m);
-                        
-                        // Step 1: Mark intention for ALL active devices
-                        for (auto& dev : g_knownDevices) {
-                            if (g_ble.connected.count(dev.address)) {
-                                if (dev.instrument == "PFD") {
-                                    dev.instrument = "TEMP_MFD";
-                                } else if (dev.instrument == "MFD") {
-                                    dev.instrument = "TEMP_PFD";
-                                }
-                            }
-                        }
-
-                        // Step 2: "Washing" - Finalize all temporary labels
-                        for (auto& dev : g_knownDevices) {
-                            if (dev.instrument == "TEMP_MFD") {
-                                dev.instrument = "MFD";
-                                std::cout << "[SWITCH] " << dev.ble_name << " [" << dev.address << "] is now MFD" << std::endl;
-                            } else if (dev.instrument == "TEMP_PFD") {
-                                dev.instrument = "PFD";
-                                std::cout << "[SWITCH] " << dev.ble_name << " [" << dev.address << "] is now PFD" << std::endl;
-                            }
-                        }
-                    }
-
-                    // Acoustic feedback & log
-                    {
-                        std::lock_guard<std::mutex> lock(g_consoleMutex);
-                        Beep(800, 150); 
-                        std::cout << "[SYSTEM] Role switch performed.\n" << std::endl;
-                        update_last_session_snapshot(); // Synchronize snapshot for reconnect
-                    }
+                    perform_role_switch(true);
                 }
                 s_was_pressed = s_is_down;
 

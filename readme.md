@@ -107,6 +107,12 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
     * **[C]**: Toggle **C**ommand output printing in the console.
     * **[?]**: Determine currently connected aircraft name.
     * **[Q]**: **Q**uit the application gracefully.
+
+1. **New Features in Recent Versions**
+    * **VS/FLC Combo to Swap Displays**: You can now swap the roles of your bezels (PFD <-> MFD) directly from the hardware! Simply press the **VS** and **FLC** buttons simultaneously on the bezel. A short high-pitch confirm beep will sound on success.
+    * **Orbiter Function**: Need a break while sightseeing? We introduced an "Orbiter" feature. While flying with Autopilot and HDG mode engaged, press **NAV** and **HDG** simultaneously. The AP will fly a continuous circle (orbit) around the point where you engaged it. The bridge app will calculate the wind correction and continuously feed shifting heading commands to MSFS. Press the combo again, or hit HDG or AP buttons to disengage. It provides varied audio beeps so you know when engagement succeeded, failed, or canceled.
+    * **Toggle Help**: Added a simple console command (**[H]**) to show the help menu inline without searching for the docs.
+
 1. **Quit and Autostart**
     * **Ending the Bridge**\
       When you are done flying for the day and like to quit the bridge app as well, simply hit **[Q]** on its consol. The app like then gracefully shut down.\
@@ -137,7 +143,10 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
           How many increments this shall equal on the sim knob.\
           How quickly signals need to come (in milliseconds) to qualify for a "very fast" turn.\
           How many increments THIS shall equal on the sim knob.\
-          How long a pause needs to be (in milliseconds) so an input is interpreted as a new turn signal.
+          How long a pause needs to be (in milliseconds) so an input is interpreted as a new turn signal.\
+          The radius (in NM) used by the Orbiter function (`orbitRadius`).\
+          The heading correction angle (in degrees) when far from the orbit center (`orbitHeadingCorrectionFar`).\
+          The heading correction angle (in degrees) when near the orbit center (`orbitHeadingCorrectionNear`).
       1. "**maps**"
       This section is a list of configurations for different Garmin device command maps.\
       Currently, there are two maps supplied with the project. For a standard Garmin G1000 as it is e.g. built into the Cesna C172 Skyhawks of MSFS2024, and the newer version G1000 NXi with a cenrtal GMC 710 panel as it can be found in the sim of the Cessna 208 Grand Caravan.\
