@@ -78,11 +78,15 @@ configure_file(
     COPYONLY
 )
 
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/SHB1000_commands.map"
-    "${CMAKE_CURRENT_BINARY_DIR}/SHB1000_commands.map"
-    COPYONLY
-)
+file(GLOB MAP_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.map")
+foreach(MAP_FILE ${MAP_FILES})
+    get_filename_component(FILE_NAME "${MAP_FILE}" NAME)
+    configure_file(
+        "${MAP_FILE}"
+        "${CMAKE_CURRENT_BINARY_DIR}/${FILE_NAME}"
+        COPYONLY
+    )
+endforeach()
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/readme.md"
@@ -90,4 +94,4 @@ configure_file(
     COPYONLY
 )
 
-install(FILES "SHB1000_known_devices.config" "SHB1000.config" "SHB1000_commands.map" "readme.md" DESTINATION .)
+install(FILES "SHB1000_known_devices.config" "SHB1000.config" "readme.md" ${MAP_FILES} DESTINATION .)

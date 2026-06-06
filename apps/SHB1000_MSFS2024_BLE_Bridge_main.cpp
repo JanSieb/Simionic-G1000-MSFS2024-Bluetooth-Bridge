@@ -49,7 +49,7 @@ using json = nlohmann::json;
 #endif
 
 // Application version
-static const std::string APP_VERSION = "1.0.4";
+static const std::string APP_VERSION = "1.0.5";
 
 // --- ORBIT LOGIC ---
 static std::atomic<bool> g_orbit_active{false};
@@ -114,6 +114,8 @@ struct GlobalSettings {
     double orbitRadius = 5.0;            // NM distance to trigger orbit
     double orbitHeadingCorrectionFar = 60.0; // Degrees to add to bearing when dist > orbitRadius
     double orbitHeadingCorrectionNear = 85.0; // Degrees to add to bearing when dist <= orbitRadius
+
+    int longPressDelayMs = 2000;            // Wait time in milliseconds to trigger a configure long-press command
 };
 static GlobalSettings g_settings;
 static std::mutex g_consoleMutex;
@@ -128,6 +130,14 @@ static std::string g_current_aircraft_title;
 // Structure for the commands: Section name -> (Hex-Code -> Command)
 using CommandMap = std::unordered_map<std::string, std::map<uint8_t, std::string>>;
 CommandMap g_commandMaps;
+CommandMap g_longCommandMaps; // For commands defined with '_l' suffix
+
+// Globals to track dynamic long presses
+static std::atomic<bool> generic_long_press_active{false};
+static std::atomic<int> generic_long_press_token{0};
+static std::atomic<uint8_t> generic_long_press_byte{0}; // Track which byte is being held
+static std::string generic_short_press_cmd; // To execute if released early
+static std::string generic_role; // To use for logging/executing
 
 // Stores the active Bluetooth connections to send commands (such as lights)
 static std::map<std::string, SimpleBLE::Peripheral> g_activePeripherals;
@@ -591,6 +601,7 @@ bool load_master_config(const std::string& filename) {
             g_settings.orbitRadius = shb.value("orbitRadius", g_settings.orbitRadius);
             g_settings.orbitHeadingCorrectionFar = shb.value("orbitHeadingCorrectionFar", g_settings.orbitHeadingCorrectionFar);
             g_settings.orbitHeadingCorrectionNear = shb.value("orbitHeadingCorrectionNear", g_settings.orbitHeadingCorrectionNear);
+            g_settings.longPressDelayMs = shb.value("longPressDelayMs", g_settings.longPressDelayMs);
         }
 
         std::cout << "[OK] Master config loaded."<< std::endl;
@@ -697,12 +708,24 @@ bool load_command_map(const std::string& filename) {
                 trim(command); // In case there were still spaces inside the quotes
             }
 
+            // Detect if this is a long-press mapping
+            bool is_long = false;
+            std::string parseHex = hexStr;
+            if (parseHex.size() >= 2 && (parseHex.substr(parseHex.size() - 2) == "_l" || parseHex.substr(parseHex.size() - 2) == "_L")) {
+                is_long = true;
+                parseHex = parseHex.substr(0, parseHex.size() - 2);
+            }
+
             // 3. Convert Hex-Key to uint8_t
             try {
-                uint8_t keyCode = (uint8_t)std::stoul(hexStr, nullptr, 16);
+                uint8_t keyCode = (uint8_t)std::stoul(parseHex, nullptr, 16);
                 
                 // 4. Save into the map (Key is now a clean MSFS code)
-                g_commandMaps[currentSection][keyCode] = command;
+                if (is_long) {
+                    g_longCommandMaps[currentSection][keyCode] = command;
+                } else {
+                    g_commandMaps[currentSection][keyCode] = command;
+                }
             } catch (...) {
                 // Simply ignore invalid lines
             }
@@ -805,14 +828,46 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
     }
     if (role.empty()) return;
 
+    uint8_t rawByte = (uint8_t)bytes[0];
+
+    // --- Generic Long Press Evaluation (Release check) ---
+    // Evaluated unconditionally before mapping checks since release bytes might not be mapped
+    if (generic_long_press_active.load() && rawByte == (uint8_t)(generic_long_press_byte.load() + 1)) {
+        generic_long_press_active.store(false);
+        generic_long_press_token++; // Invalidate timer thread
+        if (!generic_short_press_cmd.empty()) {
+            if (g_print_commands_to_console) {
+                std::cout << "[COMMAND] " << generic_role << " mapped byte 0x" << std::hex << std::uppercase << (int)generic_long_press_byte.load() << std::nouppercase << std::dec << " (short press) to: " << generic_short_press_cmd << "\n";
+            }
+            send_calc_code_safely(generic_short_press_cmd);
+        }
+    }
+
     // 2. Search the map for the set of this ROLE
     auto itMap = g_commandMaps.find(role); 
+    auto itLongMap = g_longCommandMaps.find(role);
+    
+    std::string command = "";
+    bool has_short_command = false;
     if (itMap != g_commandMaps.end()) {
-        uint8_t rawByte = (uint8_t)bytes[0];
-        
         auto itCmd = itMap->second.find(rawByte);
         if (itCmd != itMap->second.end()) {
-            std::string command = itCmd->second;
+            command = itCmd->second;
+            has_short_command = true;
+        }
+    }
+
+    std::string longCommand = "";
+    bool has_long_command = false;
+    if (itLongMap != g_longCommandMaps.end()) {
+        auto itLongCmd = itLongMap->second.find(rawByte);
+        if (itLongCmd != itLongMap->second.end()) {
+            longCommand = itLongCmd->second;
+            has_long_command = true;
+        }
+    }
+
+    if (has_short_command || has_long_command) {
             
             // Speedy dial turn functionality ---
             // Generate key to identify exactly this button of this device
@@ -918,20 +973,42 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
                 return;
             }
 
-            if (g_print_commands_to_console) {
-                // Formatting rawByte as hex
-                std::cout << "[COMMAND] " << role << " mapped byte 0x" << std::hex << std::uppercase << (int)rawByte << std::nouppercase << std::dec << " to: " << command;
-                if (repetitions > 1) {
-                    std::cout << " (x" << repetitions << ")";
-                }
-                std::cout << "\n";
+            // --- Generic Long Press Evaluation (Press check) ---
+            if (has_long_command) {
+                generic_long_press_byte.store(rawByte);
+                generic_short_press_cmd = command; // Can be empty if only _l is configured
+                generic_role = role;
+                generic_long_press_active.store(true);
+                int token = ++generic_long_press_token;
+
+                std::thread([token, rawByte, longCommand, role]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(g_settings.longPressDelayMs));
+                    if (generic_long_press_active.load() && generic_long_press_token.load() == token) {
+                        generic_long_press_active.store(false); // Timer expired, consumed long press
+                        send_calc_code_safely(longCommand);
+                        if (g_print_commands_to_console) {
+                            std::cout << "\n[COMMAND] " << role << " Long press 0x" << std::hex << std::uppercase << (int)rawByte << std::nouppercase << std::dec << " detected! Executing: " << longCommand << "\n";
+                        }
+                    }
+                }).detach();
+                return; // Halt execution for the short command! Handled on release or timeout.
             }
-            // Send the command now 1x for slow or 5x for fast turning
-            for(int i = 0; i < repetitions; ++i) {
-                send_calc_code_safely(command);
+
+            if (has_short_command) {
+                if (g_print_commands_to_console) {
+                    // Formatting rawByte as hex
+                    std::cout << "[COMMAND] " << role << " mapped byte 0x" << std::hex << std::uppercase << (int)rawByte << std::nouppercase << std::dec << " to: " << command;
+                    if (repetitions > 1) {
+                        std::cout << " (x" << repetitions << ")";
+                    }
+                    std::cout << "\n";
+                }
+                // Send the command now 1x for slow or 5x for fast turning
+                for(int i = 0; i < repetitions; ++i) {
+                    send_calc_code_safely(command);
+                }
             }
         }
-    }
 }
 
 // Helper function: Finds the Bluetooth service UUID a desired characteristic UUID runs on for a particular peripheral

@@ -102,6 +102,7 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
     * **[1] - [4]** / **[0]**: Adjust Backlight Brightness.
     * **[A]**: Manually **A**ssign a new Command Map for the current aircraft.
     * **[M]**: Reload Command **M**ap and recheck current aircraft.
+    * **[O]**: Toggle the **O**rbiter function securely from the console.
     * **[R]**: Force **R**econnect to Simionic Bezels and MSFS.
     * **[S]**: **S**wap the roles of your devices (PFD <-> MFD).
     * **[C]**: Toggle **C**ommand output printing in the console.
@@ -109,6 +110,7 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
     * **[Q]**: **Q**uit the application gracefully.
 
 1. **New Features in Recent Versions**
+    * **Long Press Support (introduced in v1.0.5)**: A long press of buttons is now supported. Alternative commands for a long press can be configured in the `.map` files. The hex key for a long press command must be the button code with the suffix `_L` (or `_l`, e.g., `4A_L = ...`).
     * **VS/FLC Combo to Swap Displays**: You can now swap the roles of your bezels (PFD <-> MFD) directly from the hardware! Simply press the **VS** and **FLC** buttons simultaneously on the bezel. A short high-pitch confirm beep will sound on success.
     * **Orbiter Function**: Need a break while sightseeing? We introduced an "Orbiter" feature. While flying with Autopilot and HDG mode engaged, press **NAV** and **HDG** simultaneously. The AP will fly a continuous circle (orbit) around the point where you engaged it. The bridge app will calculate the wind correction and continuously feed shifting heading commands to MSFS. Press the combo again, or hit HDG or AP buttons to disengage. It provides varied audio beeps so you know when engagement succeeded, failed, or canceled.
     * **Toggle Help**: Added a simple console command (**[H]**) to show the help menu inline without searching for the docs.
