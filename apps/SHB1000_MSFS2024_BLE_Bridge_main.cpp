@@ -49,13 +49,18 @@ using json = nlohmann::json;
 #endif
 
 // Application version
-static const std::string APP_VERSION = "1.0.5";
+static const std::string APP_VERSION = "1.08.1";
 
 // --- ORBIT LOGIC ---
 static std::atomic<bool> g_orbit_active{false};
 static std::atomic<bool> g_orbit_evaluation_pending{false};
 static auto g_last_orbit_time = std::chrono::steady_clock::now();
 // -------------------
+
+// --- GGGD ALARM STATE ---
+static std::atomic<bool> g_air_alarm_triggered{true};
+static std::atomic<bool> g_ground_alarm_triggered{true};
+// ------------------------
 
 // Configuration of filenames (default)
 constexpr const char* CONFIG_FILENAME = "SHB1000.config";             // HARD CODE filename for general settings
@@ -115,6 +120,8 @@ struct GlobalSettings {
     double orbitHeadingCorrectionFar = 60.0; // Degrees to add to bearing when dist > orbitRadius
     double orbitHeadingCorrectionNear = 85.0; // Degrees to add to bearing when dist <= orbitRadius
 
+    bool refuel_reminder = false;            // Feature flag for the GGGD audio reminder
+
     int longPressDelayMs = 2000;            // Wait time in milliseconds to trigger a configure long-press command
 };
 static GlobalSettings g_settings;
@@ -127,10 +134,9 @@ static std::string g_suggested_map_id;
 static std::atomic<bool> g_interactive_prompt_active{false};
 static std::string g_current_aircraft_title;
 
-// Structure for the commands: Section name -> (Hex-Code -> Command)
-using CommandMap = std::unordered_map<std::string, std::map<uint8_t, std::string>>;
+// Structure for the commands: Key (e.g. "PFD_C0") -> Command
+using CommandMap = std::unordered_map<std::string, std::string>;
 CommandMap g_commandMaps;
-CommandMap g_longCommandMaps; // For commands defined with '_l' suffix
 
 // Globals to track dynamic long presses
 static std::atomic<bool> generic_long_press_active{false};
@@ -149,31 +155,297 @@ static std::array<char, MAX_CALC_CODE_SIZE> ccode{};
 
 nlohmann::json g_master_config_json; // Global holder so we can rewrite aircraft updates without wiping comments
 void save_master_config(); // Forward declaration
+void save_known_devices(); // Forward declaration
 bool load_command_map(const std::string& filename); // Forward declaration
 void update_last_session_snapshot(); // Forward declaration
 static void play_toggle_beep(bool is_swapped, int count = 1, bool is_long = false); // Forward declaration
+static void play_gggd_sequence(); // Forward declaration
 
 // --- NATIVE SIMCONNECT FOR A-VARS ---
 #include <SimConnect.h>
 HANDLE g_hSimConnectNative = NULL;
 enum DATA_DEFINE_ID { DEFINITION_AIRCRAFT_TITLE = 1, DEFINITION_ORBIT_DATA = 2 };
 enum DATA_REQUEST_ID { REQUEST_AIRCRAFT_TITLE = 1, REQUEST_ORBIT_DATA = 2 };
+enum EVENT_ID { EVENT_SIM_RATE_INCR = 1, EVENT_SIM_RATE_DECR = 2 };
 
 struct AircraftData {
     char title[256];
 };
 
+#pragma pack(push, 1) // Ensure no padding is added so SimConnect bytes match exactly
 struct OrbitData {
     int32_t autopilot_master;
     int32_t autopilot_hdg_lock;
     double gps_wp_distance;
     double gps_wp_bearing;
+    int32_t sim_on_ground;
+    double flaps_left_percent;
+    double radio_altitude;
+    double velocity_body_z;
+    double vertical_speed;
+    int32_t simulation_rate;
 };
+#pragma pack(pop)
 
 // Global storage for the latest fetched orbit data
 static std::mutex g_orbitDataMutex;
-static OrbitData g_latestOrbitData = {0, 0, 0.0, 0.0};
+static OrbitData g_latestOrbitData = {0, 0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0};
 static std::atomic<bool> g_orbitDataReady{false};
+
+// --- SIM RATE CONTROLLER LOGIC ---
+struct SimRateControlConfig {
+    bool enabled = true;
+    char activation_hotkey = 'x';
+    int sampling_interval_ms = 100;
+    size_t window_size = 15;
+    double deadband_threshold = 1.5;
+    double trend_damping_ratio = 0.7;
+    int cooldown_downshift_ms = 2000;
+    int cooldown_rearm_upshift_ms = 20000;
+    int cooldown_evaluation_delay_ms = 3500;
+    bool console_telemetry_logging = true;
+};
+
+class SimRateController {
+private:
+    SimRateControlConfig config;
+    std::vector<double> rolling_array;
+    size_t array_index = 0;
+    std::atomic<bool> system_active{false}; 
+    
+    enum State { STABLE, UNSTABLE };
+    State current_state = STABLE;
+    
+    double last_peak_amplitude = 0.0;
+    int current_sim_rate = 1; 
+    
+    using time_point = std::chrono::steady_clock::time_point;
+    time_point last_downshift_time;
+    time_point last_unstable_time;
+    time_point last_upshift_time;
+    bool in_downshift_cooldown = false;
+    
+    // Latency locks
+    bool waiting_for_upshift_ack = false;
+    int expected_sim_rate_after_upshift = 1;
+
+    double getPeakAmplitude() const {
+        double peak = 0.0;
+        for (double val : rolling_array) {
+            peak = std::max(peak, std::abs(val));
+        }
+        return peak;
+    }
+
+    bool isBouncing() const {
+        bool has_positive = false;
+        bool has_negative = false;
+        for (double val : rolling_array) {
+            if (val > 0.0) has_positive = true;
+            if (val < 0.0) has_negative = true;
+        }
+        return has_positive && has_negative;
+    }
+
+    void downshiftSimRate() {
+        if (current_sim_rate > 1) { // Block downshift if rate is already 1x or below (0x)
+            last_peak_amplitude = getPeakAmplitude();
+            last_downshift_time = std::chrono::steady_clock::now();
+            in_downshift_cooldown = true;
+            
+            if (g_hSimConnectNative) {
+                SimConnect_TransmitClientEvent(g_hSimConnectNative, SIMCONNECT_OBJECT_ID_USER, EVENT_SIM_RATE_DECR, 0, SIMCONNECT_GROUP_PRIORITY_HIGHEST, SIMCONNECT_EVENT_FLAG_GROUPID_IS_PRIORITY);
+            }
+        }
+    }
+
+    void upshiftSimRate() {
+        if (waiting_for_upshift_ack) {
+            return; // Hard lock: block entirely until previous request resolves
+        }
+        
+        if (current_sim_rate < 16) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_upshift_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_upshift_time).count();
+            
+            // Double fail-safe gate to absolutely guarantee no multi-fires
+            if (elapsed_upshift_ms >= config.cooldown_rearm_upshift_ms) {
+                last_upshift_time = now; // Instantly lock out the next 20 seconds
+                waiting_for_upshift_ack = true; // Lock out further attempts until the sim responds
+                expected_sim_rate_after_upshift = current_sim_rate * 2;
+                
+                if (g_hSimConnectNative) {
+                    SimConnect_TransmitClientEvent(g_hSimConnectNative, SIMCONNECT_OBJECT_ID_USER, EVENT_SIM_RATE_INCR, 0, SIMCONNECT_GROUP_PRIORITY_HIGHEST, SIMCONNECT_EVENT_FLAG_GROUPID_IS_PRIORITY);
+                }
+            }
+        }
+    }
+
+public:
+    SimRateController(const SimRateControlConfig& cfg) : config(cfg) {
+        if (config.window_size % 2 == 0) {
+            config.window_size += 1; 
+        }
+        rolling_array.resize(config.window_size, 0.0);
+    }
+
+    void deactivate() {
+        if (!system_active) return;
+        system_active = false;
+        std::fill(rolling_array.begin(), rolling_array.end(), 0.0);
+        current_state = STABLE;
+        in_downshift_cooldown = false;
+
+        std::thread([this]() {
+            int attempt = 0;
+            while (!system_active && attempt < 20) {
+                if (current_sim_rate == 1) {
+                    break;
+                }
+                if (g_hSimConnectNative) {
+                    if (current_sim_rate > 1) {
+                        SimConnect_TransmitClientEvent(g_hSimConnectNative, SIMCONNECT_OBJECT_ID_USER, EVENT_SIM_RATE_DECR, 0, SIMCONNECT_GROUP_PRIORITY_HIGHEST, SIMCONNECT_EVENT_FLAG_GROUPID_IS_PRIORITY);
+                    } else if (current_sim_rate < 1) {
+                        SimConnect_TransmitClientEvent(g_hSimConnectNative, SIMCONNECT_OBJECT_ID_USER, EVENT_SIM_RATE_INCR, 0, SIMCONNECT_GROUP_PRIORITY_HIGHEST, SIMCONNECT_EVENT_FLAG_GROUPID_IS_PRIORITY);
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                attempt++;
+            }
+        }).detach();
+    }
+
+    void toggleActive() {
+        if (system_active) {
+             deactivate();
+        } else {
+             system_active = true;
+             // Reset timers to strictly enforce initial waits when (re)activated
+             auto now = std::chrono::steady_clock::now();
+             last_unstable_time = now;
+             last_upshift_time = now;
+        }
+    }
+
+    bool isActive() const { return system_active; }
+    SimRateControlConfig& getConfig() { return config; }
+
+    void processTelemetry(double v_speed_fps, int sim_rate) {
+        current_sim_rate = sim_rate;
+        auto now = std::chrono::steady_clock::now();
+        
+        // Release the network latency lock if the SimRate has caught up
+        if (waiting_for_upshift_ack && current_sim_rate >= expected_sim_rate_after_upshift) {
+            waiting_for_upshift_ack = false;
+        }
+
+        double filtered_y = 0.0;
+        if (std::abs(v_speed_fps) >= config.deadband_threshold) {
+            filtered_y = v_speed_fps;
+        }
+
+        rolling_array[array_index] = filtered_y;
+        array_index = (array_index + 1) % config.window_size;
+
+        if (!system_active) return; // Keep array primed, but skip actions
+        if (config.enabled == false) return; // Feature globally disabled
+
+        bool bouncing = isBouncing();
+        double current_peak = getPeakAmplitude();
+        bool is_quiet = (current_peak == 0.0);
+        
+        // Strict stability: Must have no sign changes AND be within deadband (all 0.0)
+        State new_state = is_quiet ? STABLE : UNSTABLE;
+        current_state = new_state;
+
+        // CRITICAL: Always keep tracking instability even during bypasses so the 
+        // 20-second cooldown timer starts perfectly from the last unquiet moment!
+        if (current_state == UNSTABLE) {
+            last_unstable_time = now;
+        }
+
+        // CRITICAL: Always keep tracking instability even during bypasses so the 
+        // 20-second cooldown timer starts perfectly from the last unquiet moment!
+        if (new_state == UNSTABLE) {
+            last_unstable_time = now;
+        }
+
+        std::string action = "NONE";
+        
+        auto elapsed_since_last_upshift = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_upshift_time).count();
+        if (waiting_for_upshift_ack) {
+            action = "AWAITING SIM ACK";
+        }
+        else if (elapsed_since_last_upshift < config.cooldown_evaluation_delay_ms) {
+            // Suspend telemetry evaluations completely to let physics settle
+            // Bypasses all downshift and upshift evaluations strictly
+            action = "SETTLING EVAL DELAY";
+        }
+        else if (in_downshift_cooldown) {
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_downshift_time).count();
+            if (elapsed_ms >= config.cooldown_downshift_ms) {
+                in_downshift_cooldown = false;
+                
+                double new_peak = getPeakAmplitude();
+                if (new_peak >= (last_peak_amplitude * config.trend_damping_ratio)) {
+                    if (current_sim_rate > 1) { // Apply floor safety here too
+                        downshiftSimRate();
+                        action = "DOWNSHIFT (SUSTAINED)";
+                    } else {
+                        action = "FLOOR (AT 1X)";
+                    }
+                } else {
+                    action = "HOLD (DECAYING)";
+                }
+            } else {
+                action = "COOLDOWN";
+            }
+        } 
+        else {
+            if (new_state == UNSTABLE && current_sim_rate > 1) {
+                // If the instability is purely sustained/constant extreme vertical speed but not bouncing,
+                // we might want to still step down or treat it as unstable
+                downshiftSimRate();
+                action = "INITIAL DOWNSHIFT";
+            } 
+            else if (new_state == UNSTABLE && current_sim_rate <= 1) {
+                // Instability detected but we are already at the floor
+                action = "FLOOR (AT 1X)";
+            }
+            else if (new_state == STABLE) {
+                auto stable_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_unstable_time).count();
+                // Instead of relying purely on current_state == STABLE which can flip in 100ms, use the strict time-differential since last upshift.
+                if (stable_duration_ms >= config.cooldown_rearm_upshift_ms &&
+                    elapsed_since_last_upshift >= config.cooldown_rearm_upshift_ms) {
+                    
+                    if (current_sim_rate < 16) {
+                        upshiftSimRate();
+                        action = "UPSHIFT";
+                    }
+                }
+            }
+        }
+        
+        current_state = new_state;
+
+        if (config.console_telemetry_logging) {
+            std::lock_guard<std::mutex> lock(g_consoleMutex);
+            std::string state_str_display = (current_state == UNSTABLE) ? (bouncing ? "BOUNCING " : "UNSTABLE ") : "STABLE   ";
+            std::cout << "[" << std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() << "] "
+                      << "| SimRate: " << current_sim_rate << "x "
+                      << "| Raw_Y: " << std::fixed << std::setprecision(2) << std::showpos << v_speed_fps << std::noshowpos
+                      << " | Filtered_Y: " << std::showpos << filtered_y << std::noshowpos
+                      << " | Array_State: " << state_str_display
+                      << " | Peak_Amp: " << current_peak
+                      << " | Action: " << action 
+                      << "\r" << std::flush;
+        }
+    }
+};
+
+static SimRateControlConfig g_simRateConfig;
+static SimRateController* g_simRateController = nullptr;
+// ---------------------------------
 
 static std::vector<std::string> tokenize_string(const std::string& str) {
     std::vector<std::string> tokens;
@@ -295,7 +567,7 @@ void CALLBACK MyNativeDispatchProc(SIMCONNECT_RECV* pData, DWORD cbData, void* p
                         std::lock_guard<std::mutex> lock(g_consoleMutex);
                         std::cout << "\n[SIMCONNECT] Currently used Aircraft: " << title;
                         std::cout << "\n[SIMCONNECT] Auto loaded Map ID: " << map_id << " (" << COMMANDS_FILENAME << ")\n";
-                        std::cout << "PRESS 'M' TO RELOAD MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | '?' FOR AIRCRAFT | 'Q' TO QUIT" << std::endl;
+                        std::cout << "PRESS 'M' TO RELOAD MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | 'L' TO ASSIGN ROLES | '?' FOR AIRCRAFT | 'Q' TO QUIT" << std::endl;
                     }
                     
                     load_command_map(COMMANDS_FILENAME);
@@ -315,6 +587,33 @@ void CALLBACK MyNativeDispatchProc(SIMCONNECT_RECV* pData, DWORD cbData, void* p
                     std::string timestamp = oss.str();
 
                     bool dist_above_orbit = (pOrbitData->gps_wp_distance > g_settings.orbitRadius);
+
+                    // --- GGGD Alarm Logic ---
+                    if (g_settings.refuel_reminder) {
+                        // Rule A: Airborne Armed Reset (Anti-Spam Filter)
+                        // Rearm the alarms only when at a safe altitude AND the aircraft is clean (flaps retracted)
+                        if (pOrbitData->radio_altitude > 500.0 && pOrbitData->flaps_left_percent < 5.0) {
+                            g_air_alarm_triggered = false;
+                            g_ground_alarm_triggered = false;
+                        }
+
+                        // Rule B: In-Air Approach Trigger (Primary Alarm)
+                        if (pOrbitData->flaps_left_percent > 95.0 && pOrbitData->sim_on_ground == 0) {
+                            if (!g_air_alarm_triggered) {
+                                std::thread(play_gggd_sequence).detach();
+                                g_air_alarm_triggered = true;
+                            }
+                        }
+
+                        // Rule C: On-Ground Failsafe Trigger (Secondary Alarm)
+                        if (pOrbitData->sim_on_ground == 1 && std::abs(pOrbitData->velocity_body_z) < 0.1 && pOrbitData->flaps_left_percent < 5.0) {
+                            if (!g_ground_alarm_triggered && g_air_alarm_triggered) {
+                                std::thread(play_gggd_sequence).detach();
+                                g_ground_alarm_triggered = true;
+                            }
+                        }
+                    }
+                    // ------------------------
 
                     if (g_print_commands_to_console) {
                         std::cout << "[" << timestamp << "] [ORBIT] AP_MASTER=" << pOrbitData->autopilot_master 
@@ -426,6 +725,40 @@ static void play_toggle_beep(bool is_swapped, int count, bool is_long) {
     }
 }
 
+// GGGD Alarm Audio Sequence
+static void play_gggd_sequence() {
+    auto play_morse_G = [](int freq) {
+        Beep(freq, 350); // Dash
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        Beep(freq, 350); // Dash
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        Beep(freq, 120); // Dot
+    };
+
+    auto play_morse_D_modified = [](int freq) {
+        Beep(freq, 580); // X-Long Dash
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        Beep(freq, 120); // Dot
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        Beep(freq, 120); // Dot
+    };
+
+    // Block 1: "Go"
+    play_morse_G(784); // G5
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    // Block 2: "Get"
+    play_morse_G(1175); // D6
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    // Block 3: "Gas"
+    play_morse_G(1047); // C6
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    // Block 4: "Dude"
+    play_morse_D_modified(1047); // C6
+}
+
 // Role Switch Helper
 static void perform_role_switch(bool play_beep = true) {
     static bool g_role_swapped_state = false;
@@ -435,14 +768,12 @@ static void perform_role_switch(bool play_beep = true) {
         // We briefly lock the BLE object so that on_packet does not read at the same time
         std::lock_guard<std::mutex> lock(g_ble.m);
         
-        // Step 1: Mark intention for ALL active devices
+        // Step 1: Mark intention for ALL active devices (even if temporarly disconnected)
         for (auto& dev : g_knownDevices) {
-            if (g_ble.connected.count(dev.address)) {
-                if (dev.instrument == "PFD") {
-                    dev.instrument = "TEMP_MFD";
-                } else if (dev.instrument == "MFD") {
-                    dev.instrument = "TEMP_PFD";
-                }
+            if (dev.instrument == "PFD") {
+                dev.instrument = "TEMP_MFD";
+            } else if (dev.instrument == "MFD") {
+                dev.instrument = "TEMP_PFD";
             }
         }
 
@@ -457,6 +788,10 @@ static void perform_role_switch(bool play_beep = true) {
             }
         }
     }
+
+    // Save the new roles explicitly so it's not lost on restart
+    save_known_devices();
+
 
     // Acoustic feedback & log
     {
@@ -528,6 +863,20 @@ void save_master_config() {
         g_master_config_json["aircraft_history"][title]["last_used"] = entry.last_used;
     }
 
+    // Ensure SimRateControl block is populated in the JSON output, particularly helpful on first run
+    nlohmann::json s_json;
+    s_json["enabled"] = g_simRateConfig.enabled;
+    s_json["activation_hotkey"] = std::string(1, g_simRateConfig.activation_hotkey);
+    s_json["sampling_interval_ms"] = g_simRateConfig.sampling_interval_ms;
+    s_json["window_size"] = g_simRateConfig.window_size;
+    s_json["deadband_threshold"] = g_simRateConfig.deadband_threshold;
+    s_json["trend_damping_ratio"] = g_simRateConfig.trend_damping_ratio;
+    s_json["cooldown_downshift_ms"] = g_simRateConfig.cooldown_downshift_ms;
+    s_json["cooldown_rearm_upshift_ms"] = g_simRateConfig.cooldown_rearm_upshift_ms;
+    s_json["cooldown_evaluation_delay_ms"] = g_simRateConfig.cooldown_evaluation_delay_ms;
+    s_json["console_telemetry_logging"] = g_simRateConfig.console_telemetry_logging;
+    g_master_config_json["SimRateControl"] = s_json;
+
     std::ofstream file(CONFIG_FILENAME);
     if (file.is_open()) {
         file << g_master_config_json.dump(2);
@@ -556,6 +905,41 @@ bool load_master_config(const std::string& filename) {
             }
 
             g_settings.default_map_id = j["general"].value("default_map_id", "std_g1000");
+            g_settings.refuel_reminder = j["general"].value("refuel_reminder", false);
+        }
+
+        // Apply SimRateControl from config
+        if (j.contains("SimRateControl")) {
+            auto& s_json = j["SimRateControl"];
+            g_simRateConfig.enabled = s_json.value("enabled", true);
+            
+            std::string hotkey_str = s_json.value("activation_hotkey", "x");
+            if (!hotkey_str.empty()) g_simRateConfig.activation_hotkey = std::tolower(hotkey_str[0]);
+            
+            g_simRateConfig.sampling_interval_ms = s_json.value("sampling_interval_ms", 100);
+            g_simRateConfig.window_size = s_json.value("window_size", 15);
+            g_simRateConfig.deadband_threshold = s_json.value("deadband_threshold", 1.5);
+            g_simRateConfig.trend_damping_ratio = s_json.value("trend_damping_ratio", 0.7);
+            g_simRateConfig.cooldown_downshift_ms = s_json.value("cooldown_downshift_ms", 2000);
+            g_simRateConfig.cooldown_rearm_upshift_ms = s_json.value("cooldown_rearm_upshift_ms", 20000);
+            g_simRateConfig.cooldown_evaluation_delay_ms = s_json.value("cooldown_evaluation_delay_ms", 2000);
+            g_simRateConfig.console_telemetry_logging = s_json.value("console_telemetry_logging", true);
+        } else {
+            // Write defaults to global JSON so it gets persisted next time save_master_config is called
+            nlohmann::json s_json;
+            s_json["enabled"] = g_simRateConfig.enabled;
+            s_json["activation_hotkey"] = std::string(1, g_simRateConfig.activation_hotkey);
+            s_json["sampling_interval_ms"] = g_simRateConfig.sampling_interval_ms;
+            s_json["window_size"] = g_simRateConfig.window_size;
+            s_json["deadband_threshold"] = g_simRateConfig.deadband_threshold;
+            s_json["trend_damping_ratio"] = g_simRateConfig.trend_damping_ratio;
+            s_json["cooldown_downshift_ms"] = g_simRateConfig.cooldown_downshift_ms;
+            s_json["cooldown_rearm_upshift_ms"] = g_simRateConfig.cooldown_rearm_upshift_ms;
+            s_json["cooldown_evaluation_delay_ms"] = g_simRateConfig.cooldown_evaluation_delay_ms;
+            s_json["console_telemetry_logging"] = g_simRateConfig.console_telemetry_logging;
+            
+            g_master_config_json["SimRateControl"] = s_json;
+            // Optionally force an immediate save here: save_master_config(); 
         }
         
         // Apply maps dictionary
@@ -661,78 +1045,54 @@ bool load_known_devices(const std::string& filename) {
 // Loads the command mapping from the config file to translate button/dial codes to sim commands
 bool load_command_map(const std::string& filename) {
     std::ifstream file(filename);
-    std::string line, currentSection;
+    std::string line;
 
     if (!file.is_open()) {
         std::cerr << "Error: Could not open " << filename << "!" << std::endl;
         return false;
     }
 
+    g_commandMaps.clear();
+
     while (std::getline(file, line)) {
         // Ignore comments and empty lines
-        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[') continue; // Also ignore header lines in the new format if any remain
 
-        // Detect section: [Name]
-        if (line[0] == '[') {
-            // Ignore the "_Commands" part in the section so we are more flexible later (e.g. "PFD_Commands" -> "PFD", "MFD_Commands" -> "MFD", etc.)
-            size_t underscorePos = line.find('_');
-            if (underscorePos != std::string::npos) {
-                currentSection = line.substr(1, underscorePos - 1);
-            } else {
-                // Fallback: If there is no underscore, take everything up to ']'
-                currentSection = line.substr(1, line.find(']') - 1);
-            }
-            continue;
-        }
-
-        // Parse command lines (Format: 4A = "Command")
+        // Parse command lines (Format: PFD_4A = "Command")
         size_t delimiter = line.find('=');
-        if (delimiter != std::string::npos && !currentSection.empty()) {
-            std::string hexStr = line.substr(0, delimiter);
+        if (delimiter != std::string::npos) {
+            std::string keyStr = line.substr(0, delimiter);
             std::string command = line.substr(delimiter + 1);
 
             // 1. Helper function for trimming (remove spaces front/back)
             auto trim = [](std::string& s) {
                 size_t first = s.find_first_not_of(" \t\r\n");
-                if (first == std::string::npos) return;
+                if (first == std::string::npos) { s = ""; return; }
                 size_t last = s.find_last_not_of(" \t\r\n");
                 s = s.substr(first, (last - first + 1));
             };
 
-            trim(hexStr);
+            trim(keyStr);
             trim(command);
+
+            // Convert key to upper case for case-insensitive lookup
+            std::transform(keyStr.begin(), keyStr.end(), keyStr.begin(),
+                [](unsigned char c){ return std::toupper(c); });
 
             // 2. Remove quotes, if present
             if (command.size() >= 2 && command.front() == '"' && command.back() == '"') {
                 command = command.substr(1, command.size() - 2);
                 trim(command); // In case there were still spaces inside the quotes
             }
-
-            // Detect if this is a long-press mapping
-            bool is_long = false;
-            std::string parseHex = hexStr;
-            if (parseHex.size() >= 2 && (parseHex.substr(parseHex.size() - 2) == "_l" || parseHex.substr(parseHex.size() - 2) == "_L")) {
-                is_long = true;
-                parseHex = parseHex.substr(0, parseHex.size() - 2);
-            }
-
-            // 3. Convert Hex-Key to uint8_t
-            try {
-                uint8_t keyCode = (uint8_t)std::stoul(parseHex, nullptr, 16);
-                
-                // 4. Save into the map (Key is now a clean MSFS code)
-                if (is_long) {
-                    g_longCommandMaps[currentSection][keyCode] = command;
-                } else {
-                    g_commandMaps[currentSection][keyCode] = command;
-                }
-            } catch (...) {
-                // Simply ignore invalid lines
+            
+            // 3. Save into the map
+            // We use the full string as key, e.g. "PFD_C0" or "PFD_C0_L"
+            if (!keyStr.empty() && !command.empty()) {
+                g_commandMaps[keyStr] = command;
             }
         }
-
     }
-    std::cout << "[OK] Command mapping successfully loaded." << std::endl;
+    std::cout << "[OK] Command mapping successfully loaded. Entries: " << g_commandMaps.size() << std::endl;
     return true;
 }
 
@@ -818,6 +1178,12 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
     std::string cleanMac;
     canonicalize_mac(devTag, cleanMac);
 
+    // Deactivate eXcellerate on any input
+    if (g_simRateController && g_simRateController->isActive()) {
+        g_simRateController->deactivate();
+        std::cout << "\n[SYSTEM] SimRate Auto-Correction deactivated by device input.\n";
+    }
+
     // 1. Find out which ROLE this MAC currently has
     std::string role = "";
     for (const auto& dev : g_knownDevices) {
@@ -843,28 +1209,29 @@ void on_packet(const SimpleBLE::ByteArray& bytes, const std::string& devTag) {
         }
     }
 
-    // 2. Search the map for the set of this ROLE
-    auto itMap = g_commandMaps.find(role); 
-    auto itLongMap = g_longCommandMaps.find(role);
+    std::stringstream key_stream;
+    key_stream << role << "_" << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << (int)rawByte;
+    std::string shortKey = key_stream.str();
+    std::string longKey = shortKey + "_L";
     
+    if (g_print_commands_to_console) {
+        std::cout << "[DEBUG] Looking for key: '" << shortKey << "'" << std::endl;
+    }
+
     std::string command = "";
     bool has_short_command = false;
-    if (itMap != g_commandMaps.end()) {
-        auto itCmd = itMap->second.find(rawByte);
-        if (itCmd != itMap->second.end()) {
-            command = itCmd->second;
-            has_short_command = true;
-        }
+    auto itShort = g_commandMaps.find(shortKey);
+    if (itShort != g_commandMaps.end()) {
+        command = itShort->second;
+        has_short_command = true;
     }
 
     std::string longCommand = "";
     bool has_long_command = false;
-    if (itLongMap != g_longCommandMaps.end()) {
-        auto itLongCmd = itLongMap->second.find(rawByte);
-        if (itLongCmd != itLongMap->second.end()) {
-            longCommand = itLongCmd->second;
-            has_long_command = true;
-        }
+    auto itLong = g_commandMaps.find(longKey);
+    if (itLong != g_commandMaps.end()) {
+        longCommand = itLong->second;
+        has_long_command = true;
     }
 
     if (has_short_command || has_long_command) {
@@ -1319,9 +1686,9 @@ int ble_run_session_scan_until_all_addresses(
                 if (subscribed) {
                     std::lock_guard<std::mutex> lk(g_ble.m);
                     // 1. Data logic (Map for button presses)
-                    g_ble.connected.emplace(mac, ConnectedDevice{p, service_uuid, char_uuid, used_indicate});
+                    g_ble.connected.emplace(clean_addr, ConnectedDevice{p, service_uuid, char_uuid, used_indicate});
                     // 2. Light control (Map for write access)
-                    g_activePeripherals.insert_or_assign(mac, p);
+                    g_activePeripherals.insert_or_assign(clean_addr, p);
                     
                     std::cout << "   [OK] " << (used_indicate ? "Indication" : "Notification") << " active." << std::endl;
                     connectedCount++;
@@ -1568,7 +1935,7 @@ int ble_run_session_scan_until_all_addresses(
     std::cout << "----------------------------------------------------\n" << std::endl;
 
     // --- PHASE 3: WAIT LOOP FOR RECONNECT OR QUIT ---
-    std::cout << "PRESS 'H' FOR HELP | 'M' TO RELOAD MAP | 'A' TO ASSIGN MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | 'C' TO TOGGLE CMD PRINT | '?' FOR AIRCRAFT | 'Q' TO QUIT\n" << std::endl;
+    std::cout << "PRESS 'H' FOR HELP | 'M' TO RELOAD MAP | 'A' TO ASSIGN MAP | 'R' TO RECONNECT | 'S' TO SWAP ROLES | 'L' TO ASSIGN ROLES | 'C' TO TOGGLE CMD PRINT | '?' FOR AIRCRAFT | 'Q' TO QUIT\n" << std::endl;
 
     while (!g_ble.shuttingDown) {
         // Check for pending aircraft to prompt
@@ -1652,6 +2019,23 @@ int ble_run_session_scan_until_all_addresses(
         if (_kbhit()) {
             char ch = _getch();
 
+            if (std::tolower(ch) == g_simRateConfig.activation_hotkey) {
+                if (g_simRateController) {
+                    g_simRateController->toggleActive();
+                    std::cout << "\n[SYSTEM] SimRate Auto-Correction is now " 
+                              << (g_simRateController->isActive() ? "ACTIVE" : "INACTIVE") << "\n";
+                }
+                continue;
+            }
+
+            if (ch == '-') {
+                if (g_simRateController && g_simRateController->isActive()) {
+                    g_simRateController->deactivate();
+                    std::cout << "\n[SYSTEM] SimRate Auto-Correction is now INACTIVE\n";
+                }
+                continue;
+            }
+
             if (ch == 'a' || ch == 'A') {
                 if (g_current_aircraft_title.empty()) {
                     std::cout << "\n[SYSTEM] No aircraft loaded yet. Cannot assign map.\n";
@@ -1705,6 +2089,47 @@ int ble_run_session_scan_until_all_addresses(
                 }
             }
 
+            if (ch == 'l' || ch == 'L') {
+                g_interactive_prompt_active = true;
+                std::cout << "\n--- Manual Role Assignment ---\n";
+                bool changed = false;
+                for (auto& dev : g_knownDevices) {
+                    if (dev.address.empty()) continue;
+                    std::cout << "Device: " << dev.ble_name << " [" << dev.address << "] is currently: " << dev.instrument << "\n";
+                    std::cout << "Enter new role (P=PFD, M=MFD, R=RADIO), or any other key to keep: ";
+                    
+                    int wait_ms = 10000;
+                    char choice = 0;
+                    while (wait_ms > 0 && !g_ble.shuttingDown) {
+                        if (_kbhit()) {
+                            choice = std::toupper(_getch());
+                            std::cout << choice << "\n";
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        wait_ms -= 100;
+                    }
+                    
+                    if (choice == 0) {
+                         std::cout << " Timeout.\n";
+                    } else if (choice == 'P' || choice == 'M' || choice == 'R') {
+                         if (choice == 'P') dev.instrument = "PFD";
+                         else if (choice == 'M') dev.instrument = "MFD";
+                         else if (choice == 'R') dev.instrument = "RADIO";
+                         changed = true;
+                    }
+                    std::cout << " -> Final role: " << dev.instrument << "\n\n";
+                }
+                if (changed) {
+                    save_known_devices();
+                    update_last_session_snapshot();
+                    std::cout << "[OK] Roles updated and saved.\n";
+                } else {
+                    std::cout << "[OK] No changes made.\n";
+                }
+                g_interactive_prompt_active = false;
+            }
+
             if (ch == 'h' || ch == 'H') {
                 std::lock_guard<std::mutex> lock(g_consoleMutex);
                 std::cout << "\n--- Console Shortcuts Quick Reference ---\n";
@@ -1716,6 +2141,7 @@ int ble_run_session_scan_until_all_addresses(
                 std::cout << "  [M]     : Reload Command Map and recheck current aircraft.\n";
                 std::cout << "  [R]     : Force Reconnect to Simionic Bezels and MSFS.\n";
                 std::cout << "  [S]     : Swap the roles of your devices (PFD <-> MFD).\n";
+                std::cout << "  [L]     : Assign Roles to your known devices.\n";
                 std::cout << "  [C]     : Toggle Command output printing in the console.\n";
                 std::cout << "  [?]     : Determine currently connected aircraft name.\n";
                 std::cout << "  [Q]     : Quit the application gracefully.\n";
@@ -1753,9 +2179,10 @@ int ble_run_session_scan_until_all_addresses(
             }
         }
         
-        if (g_orbit_active && g_hSimConnectNative) {
+        if (g_hSimConnectNative) {
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - g_last_orbit_time).count() >= 5000) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - g_last_orbit_time).count() >= 500) {
+                // Request this data fast (every 500ms instead of 5s) because we want GGGD telemetry to be responsive.
                 SimConnect_RequestDataOnSimObject(g_hSimConnectNative, REQUEST_ORBIT_DATA, DEFINITION_ORBIT_DATA, SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD_ONCE);
                 g_last_orbit_time = now;
             }
@@ -1986,21 +2413,40 @@ int main(int argc, char* argv[]) {
                     SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "AUTOPILOT HEADING LOCK", "Bool", SIMCONNECT_DATATYPE_INT32);
                     SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "GPS WP DISTANCE", "Nautical miles", SIMCONNECT_DATATYPE_FLOAT64);
                     SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "GPS WP BEARING", "Degrees", SIMCONNECT_DATATYPE_FLOAT64);
-                    std::cout << "[INFO] Native SimConnect connection established for A-Vars." << std::endl;
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "SIM ON GROUND", "Bool", SIMCONNECT_DATATYPE_INT32);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "TRAILING EDGE FLAPS LEFT PERCENT", "Percent", SIMCONNECT_DATATYPE_FLOAT64);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "PLANE ALT ABOVE GROUND", "Feet", SIMCONNECT_DATATYPE_FLOAT64);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "VELOCITY BODY Z", "Feet per second", SIMCONNECT_DATATYPE_FLOAT64);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "VERTICAL SPEED", "Feet per minute", SIMCONNECT_DATATYPE_FLOAT64);
+                    SimConnect_AddToDataDefinition(g_hSimConnectNative, DEFINITION_ORBIT_DATA, "SIMULATION RATE", "Number", SIMCONNECT_DATATYPE_INT32);
+                    
+                    SimConnect_MapClientEventToSimEvent(g_hSimConnectNative, EVENT_SIM_RATE_INCR, "SIM_RATE_INCR");
+                    SimConnect_MapClientEventToSimEvent(g_hSimConnectNative, EVENT_SIM_RATE_DECR, "SIM_RATE_DECR");
+                    
+                    std::cout << "[INFO] Native SimConnect connection established for A-Vars and Events." << std::endl;
                     initial_aircraft_check_done = false;
                 }
             }
             if (g_hSimConnectNative) {
-                SimConnect_CallDispatch(g_hSimConnectNative, MyNativeDispatchProc, NULL);
+                HRESULT hr = SimConnect_CallDispatch(g_hSimConnectNative, MyNativeDispatchProc, NULL);
                 
-                // Trigger auto load the very first time the plane fully connects
-                if (g_discoveryFinished && !initial_aircraft_check_done) {
-                    initial_aircraft_check_done = true;
-                    std::cout << "\n[SIMCONNECT] Auto-requesting current aircraft to load mapping..." << std::endl;
-                    SimConnect_RequestDataOnSimObject(g_hSimConnectNative, REQUEST_AIRCRAFT_TITLE, DEFINITION_AIRCRAFT_TITLE, SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD_ONCE);
+                if (FAILED(hr)) {
+                    std::cout << "\n[SIMCONNECT] Native connection lost! Will attempt to reconnect..." << std::endl;
+                    SimConnect_Close(g_hSimConnectNative);
+                    g_hSimConnectNative = NULL;
+                } else {
+                    // Periodic refresh of Orbit Data to drive SimRate tracking
+                    SimConnect_RequestDataOnSimObject(g_hSimConnectNative, REQUEST_ORBIT_DATA, DEFINITION_ORBIT_DATA, SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD_ONCE);
+                    
+                    // Trigger auto load the very first time the plane fully connects
+                    if (g_discoveryFinished && !initial_aircraft_check_done) {
+                        initial_aircraft_check_done = true;
+                        std::cout << "\n[SIMCONNECT] Auto-requesting current aircraft to load mapping..." << std::endl;
+                        SimConnect_RequestDataOnSimObject(g_hSimConnectNative, REQUEST_AIRCRAFT_TITLE, DEFINITION_AIRCRAFT_TITLE, SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD_ONCE);
+                    }
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Base SimConnect loop rate
         }
         if (g_hSimConnectNative) {
             SimConnect_Close(g_hSimConnectNative);
@@ -2008,6 +2454,31 @@ int main(int argc, char* argv[]) {
         }
     });
     nativeSimConnectThread.detach();
+
+    // >>> SIM RATE MONITORING THREAD <<<
+    g_simRateController = new SimRateController(g_simRateConfig);
+    std::thread simRateTelemetryThread([&]() {
+        while (!g_ble.shuttingDown) {
+            if (g_simRateController && g_hSimConnectNative && g_orbitDataReady) {
+                // Safely extract the latest values
+                double v_speed_fpm;
+                int s_rate;
+                {
+                    std::lock_guard<std::mutex> lock(g_orbitDataMutex);
+                    v_speed_fpm = g_latestOrbitData.vertical_speed;
+                    s_rate = g_latestOrbitData.simulation_rate;
+                }
+                
+                // Convert Feet Per Minute to Feet Per Second to match array sensitivity expectations
+                double v_speed_fps = v_speed_fpm / 60.0;
+                
+                // Run the rolling array logic (which handles its own deadband & state)
+                g_simRateController->processTelemetry(v_speed_fps, s_rate);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(g_simRateConfig.sampling_interval_ms)); // Polling rate
+        }
+    });
+    simRateTelemetryThread.detach();
 
     // >>> HEARTBEAT THREAD <<<
     std::thread heartbeatThread([&]() {

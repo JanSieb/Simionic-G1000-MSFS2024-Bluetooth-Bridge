@@ -93,6 +93,9 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
     You can also apply this trick if you only have one bezel.\
     Hitting the **[S]** key will allow you to steer the cockpit's MFD using the same bezel. Don't forget to swap back to bring it back into PFD mode...\
     Needless to say, this only swaps the button input, but NOT what you see on a screen you might have plugged into the bezel...
+1. **Assign Roles Manually**
+    * If a hardware device somehow lost its role (e.g., after an unexpected reconnection) or you want to explicitly overwrite its persistent assignment without swapping, you can press **[L]**.
+      The application will loop over all known devices and prompt you to enforce a new role (`P=PFD`, `M=MFD`, `R=RADIO`). Your choice will be immediately saved.
 1. **Print Commands to Console**
     * By default, the bridge silently passes button inputs from the bezel directly to the simulator.
     * If you want to see which buttons emit which hex-code byte and which MSFS command they map to, you can press **[C]** on the app console. This will toggle command printing on or off.
@@ -106,13 +109,18 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
     * **[R]**: Force **R**econnect to Simionic Bezels and MSFS.
     * **[S]**: **S**wap the roles of your devices (PFD <-> MFD).
     * **[C]**: Toggle **C**ommand output printing in the console.
+    * **[X]**: Toggle the e**X**cellerate SimRate auto-correction (auto-speed up/down based on vertical speed stability).
+    * **[-]**: Explicitly turn OFF eXcellerate. NOTE: The eXcellerate function will also automatically be turned OFF (and the SimRate returns to 1x securely) as soon as any input is registered from the bezel (button push, dial turn).
     * **[?]**: Determine currently connected aircraft name.
     * **[Q]**: **Q**uit the application gracefully.
 
 1. **New Features in Recent Versions**
-    * **Long Press Support (introduced in v1.0.5)**: A long press of buttons is now supported. Alternative commands for a long press can be configured in the `.map` files. The hex key for a long press command must be the button code with the suffix `_L` (or `_l`, e.g., `4A_L = ...`).
+    * **Go Get Gas, Dude! (GGGD) Alarm**: A short acoustic reminder pattern chiming when configuring the aircraft for final approach to remind the pilot in a career setting to use keyboard commands to buy virtual fuel before touching down. This feature acts entirely transparently of virtual sim fuel tanks. It is optional and can be switched off in `SHB1000.config` using the `"refuel_reminder"` property inside the `"general"` block.
+    * **Long Press Support (introduced in v1.0.5)**: A long press of buttons is now supported. Alternative commands for a long press can be configured in the `.map` files. The hex key for a long press command must be the button code with the suffix `_L` (or `_l`, e.g., `PFD_4A_L = ...`).
+    * **Command Maps syntax**: Mapping files use a simple `PREFIX_CODE = "Command"` format, where the prefix determines the active role (e.g. `PFD_C0`, `MFD_C0`). This is a recent architecture overhaul to allow very simple swapping of device roles on the fly!
     * **VS/FLC Combo to Swap Displays**: You can now swap the roles of your bezels (PFD <-> MFD) directly from the hardware! Simply press the **VS** and **FLC** buttons simultaneously on the bezel. A short high-pitch confirm beep will sound on success.
     * **Orbiter Function**: Need a break while sightseeing? We introduced an "Orbiter" feature. While flying with Autopilot and HDG mode engaged, press **NAV** and **HDG** simultaneously. The AP will fly a continuous circle (orbit) around the point where you engaged it. The bridge app will calculate the wind correction and continuously feed shifting heading commands to MSFS. Press the combo again, or hit HDG or AP buttons to disengage. It provides varied audio beeps so you know when engagement succeeded, failed, or canceled.
+    * **eXcellerate (Auto SimRate Controller)**: Dynamically adjusts your Simulator Rate based on the vertical speed. It watches for stable cruising periods automatically speeding you up (up to maximum allowed rate 16x) and will forcefully drop you down to 1x the moment turbulence or other severe altitude fluctuations occur. You can configure aggressiveness, window-sizes and cooldown periods from the `SHB1000.config`. Toggle on/off by pressing **[X]** in the console. Furthermore, any interaction with the bezel device, or pressing **[-]**, immediately turns the function off and securely returns the simulation to 1x.
     * **Toggle Help**: Added a simple console command (**[H]**) to show the help menu inline without searching for the docs.
 
 1. **Quit and Autostart**
@@ -148,7 +156,8 @@ The corresponding external hardware device (like the Simionic SHB1000) powered o
           How long a pause needs to be (in milliseconds) so an input is interpreted as a new turn signal.\
           The radius (in NM) used by the Orbiter function (`orbitRadius`).\
           The heading correction angle (in degrees) when far from the orbit center (`orbitHeadingCorrectionFar`).\
-          The heading correction angle (in degrees) when near the orbit center (`orbitHeadingCorrectionNear`).
+          The heading correction angle (in degrees) when near the orbit center (`orbitHeadingCorrectionNear`).\
+          An optional "Go Get Gas, Dude!" flag (`refuel_reminder`) to softly chime when on final approach to remind the pilot to refuel the aircraft via a macro. (False by default).
       1. "**maps**"
       This section is a list of configurations for different Garmin device command maps.\
       Currently, there are two maps supplied with the project. For a standard Garmin G1000 as it is e.g. built into the Cesna C172 Skyhawks of MSFS2024, and the newer version G1000 NXi with a cenrtal GMC 710 panel as it can be found in the sim of the Cessna 208 Grand Caravan.\
